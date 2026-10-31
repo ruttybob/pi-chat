@@ -23,7 +23,8 @@ export interface AccountFeedCallbacks {
 		own: boolean,
 	): Promise<void>;
 	onTopicCreated(chatId: string, threadId: number, name: string): Promise<void>;
-	// DM topics send no forum_topic_created service message, so the feed reports them
+	// DM topics send no forum_topic_created service message, and supergroup topics
+	// created while the bot was offline never send one — the feed reports such topics
 	// from the first message instead (only for chats that already have a channel).
 	onTopicObserved(chatId: string, threadId: number): Promise<void>;
 	onError(error: Error, context?: { chatId?: string; channelKey?: string }): Promise<void>;
@@ -119,9 +120,11 @@ export function startAccountFeed(options: {
 		};
 		let config = await loadChatConfig();
 		let entry = findEntry(config);
-		if (!entry && threadedDm && threadId !== undefined) {
+		if (!entry && forum && threadId !== undefined) {
 			// First message from an unknown topic lazily registers its channel — only inside
-			// an already-configured chat, so unknown DMs stay unregistered (trust boundary).
+			// an already-configured chat, so unknown chats stay unregistered (trust boundary).
+			// DM topics never send forum_topic_created; supergroup topics do, but it is
+			// missed when the topic is created while the bot is offline.
 			const account = config.accounts[accountId];
 			if (account?.service === "telegram" && Object.values(account.channels).some((channel) => channel.id === chatId)) {
 				await callbacks.onTopicObserved(chatId, threadId);
