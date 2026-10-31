@@ -3,9 +3,9 @@ import { BorderedLoader } from "@mariozechner/pi-coding-agent";
 
 import { saveChatConfig } from "../config.js";
 import type { AccessPolicy, ChatConfig, ConfiguredChannel, TelegramAccountConfig } from "../core/config-types.js";
-import { makeAccountKey, makeChannelKey } from "../core/keys.js";
+import { ensureUniqueKey, makeAccountKey, makeChannelKey } from "../core/keys.js";
 import { refreshAccountSnapshot, updateAccountIdentityFromSnapshot, validateAccountDraft } from "../services/index.js";
-import { runWithLoader, showNotice } from "./dialogs.js";
+import { runWithLoader, selectItem, showNotice } from "./dialogs.js";
 
 interface TelegramApiResponse<T> {
 	ok: boolean;
@@ -27,6 +27,7 @@ interface TelegramChat {
 	username?: string;
 	first_name?: string;
 	last_name?: string;
+	is_forum?: boolean;
 }
 
 interface TelegramMessage {
@@ -35,6 +36,12 @@ interface TelegramMessage {
 	from?: TelegramUser;
 	text?: string;
 	caption?: string;
+	message_thread_id?: number;
+	is_topic_message?: boolean;
+	forum_topic_created?: {
+		name: string;
+		message_thread_id: number;
+	};
 }
 
 interface TelegramUpdate {
@@ -43,13 +50,15 @@ interface TelegramUpdate {
 	edited_message?: TelegramMessage;
 }
 
-type TelegramSetupMode = "dm" | "group";
+type TelegramSetupMode = "dm" | "group" | "topic";
 
 interface ObservedTelegramTarget {
 	chatId: string;
 	chatName: string;
 	userId?: string;
 	userName?: string;
+	threadId?: number;
+	topicName?: string;
 }
 
 function displayName(user: TelegramUser | undefined): string | undefined {
@@ -59,13 +68,6 @@ function displayName(user: TelegramUser | undefined): string | undefined {
 
 function chatDisplayName(chat: TelegramChat): string {
 	return chat.title || chat.username || [chat.first_name, chat.last_name].filter(Boolean).join(" ") || String(chat.id);
-}
-
-function ensureUniqueKey(existing: Record<string, unknown>, base: string): string {
-	if (!existing[base]) return base;
-	let index = 2;
-	while (existing[`${base}-${index}`]) index += 1;
-	return `${base}-${index}`;
 }
 
 async function callTelegram<T>(botToken: string, method: string, body: Record<string, unknown>): Promise<T> {
@@ -88,7 +90,10 @@ async function getLatestUpdateId(botToken: string): Promise<number | undefined> 
 function buildSetupMessage(mode: TelegramSetupMode, botUsername?: string): string {
 	const webLink = botUsername ? `https://web.telegram.org/k/#@${botUsername}` : undefined;
 	const appLink = botUsername ? `tg://resolve?domain=${botUsername}` : undefined;
-	const lines = [mode === "dm" ? "Telegram DM setup" : "Telegram group setup", ""];
+	const lines = [
+		mode === "dm" ? "Telegram DM setup" : mode === "topic" ? "Telegram topic setup" : "Telegram group setup",
+		"",
+	];
 	if (botUsername) {
 		lines.push(`Bot: @${botUsername}`);
 		lines.push(`Open in Telegram Web: ${webLink}`);
@@ -96,7 +101,10 @@ function buildSetupMessage(mode: TelegramSetupMode, botUsername?: string): strin
 		lines.push("");
 	}
 	if (mode === "dm") lines.push("Open the bot DM and send /start.");
-	else {
+	else if (mode === "topic") {
+		lines.push("Send any message in the target forum topic (including General).");
+		lines.push("Creating a topic in Telegram works too — its first message is enough.");
+	} else {
 		lines.push("Add the bot to the target group.");
 		lines.push("Then send /start or mention the bot in that group.");
 	}
@@ -106,6 +114,19 @@ function buildSetupMessage(mode: TelegramSetupMode, botUsername?: string): strin
 function matchObservedTarget(message: TelegramMessage, mode: TelegramSetupMode): ObservedTelegramTarget | undefined {
 	if (mode === "dm" && message.chat.type !== "private") return undefined;
 	if (mode === "group" && message.chat.type !== "group" && message.chat.type !== "supergroup") return undefined;
+	if (mode === "topic") {
+		if (message.chat.type !== "supergroup") return undefined;
+		const threadId = message.forum_topic_created?.message_thread_id ?? message.message_thread_id;
+		if (threadId === undefined) return undefined;
+		return {
+			chatId: String(message.chat.id),
+			chatName: chatDisplayName(message.chat),
+			userId: message.from ? String(message.from.id) : undefined,
+			userName: displayName(message.from),
+			threadId,
+			topicName: message.forum_topic_created?.name,
+		};
+	}
 	return {
 		chatId: String(message.chat.id),
 		chatName: chatDisplayName(message.chat),
@@ -210,25 +231,102 @@ export async function addTelegramObservedTargetToAccount(
 ): Promise<string | undefined> {
 	const observed = await observeTelegramTarget(ctx, account.botToken, account.botUsername, mode);
 	if (!observed) return undefined;
-	const channelAccess: AccessPolicy = {
-		trigger: mode === "dm" ? "message" : "mention",
-		ignoreBots: true,
-		allowedUserIds: mode === "dm" && observed.userId ? [observed.userId] : undefined,
-	};
-	const baseChannelKey = makeChannelKey(
-		mode === "dm" ? `dm-${observed.userName || observed.chatName}` : observed.chatName,
-		observed.chatId,
-	);
-	const channelKey = ensureUniqueKey(account.channels, baseChannelKey);
+	const channelAccess: AccessPolicy =
+		mode === "dm"
+			? {
+					trigger: "message",
+					ignoreBots: true,
+					allowedUserIds: observed.userId ? [observed.userId] : undefined,
+				}
+			: { trigger: "mention", ignoreBots: true };
 	const channel: ConfiguredChannel = {
 		id: observed.chatId,
-		name: observed.chatName,
 		dm: mode === "dm",
 		access: channelAccess,
 	};
+	let baseChannelKey: string;
+	if (mode === "topic") {
+		const topicName = observed.topicName || `topic-${observed.threadId}`;
+		channel.threadId = observed.threadId;
+		channel.name = topicName;
+		baseChannelKey = makeChannelKey(`${observed.chatName}-${topicName}`, `${observed.chatId}-${observed.threadId}`);
+	} else {
+		channel.name = observed.chatName;
+		baseChannelKey = makeChannelKey(
+			mode === "dm" ? `dm-${observed.userName || observed.chatName}` : observed.chatName,
+			observed.chatId,
+		);
+	}
+	const channelKey = ensureUniqueKey(account.channels, baseChannelKey);
 	account.channels[channelKey] = channel;
 	config.accounts[accountId] = account;
 	await saveChatConfig(config);
 	await showNotice(ctx, "Telegram channel configured", `Configured ${accountId}/${channelKey}`, "info");
+	return channelKey;
+}
+
+// Bot-created topic: needs the bot to be a group admin with "Manage Topics".
+export async function createTelegramTopicChannel(
+	ctx: ExtensionContext,
+	config: ChatConfig,
+	accountId: string,
+	account: TelegramAccountConfig,
+): Promise<string | undefined> {
+	const groupChannels = Object.entries(account.channels).filter(
+		([, channel]) => !channel.dm && channel.threadId === undefined,
+	);
+	if (groupChannels.length === 0) {
+		await showNotice(
+			ctx,
+			"No group channel",
+			"Add a group channel first — topics are created inside a configured group.",
+			"warning",
+		);
+		return undefined;
+	}
+	const picked = await selectItem(
+		ctx,
+		"Create topic in which group?",
+		groupChannels.map(([key, channel]) => ({ value: key, label: channel.name ?? key })),
+	);
+	if (!picked) return undefined;
+	const group = account.channels[picked];
+	if (!group) return undefined;
+	const topicName = await ctx.ui.input("New topic name", "e.g. bugs");
+	if (!topicName?.trim()) return undefined;
+	const result = await runWithLoader(ctx, "Creating topic...", () =>
+		callTelegram<{ message_thread_id: number }>(account.botToken, "createForumTopic", {
+			chat_id: Number(group.id),
+			name: topicName.trim(),
+		}),
+	);
+	if (result.error) {
+		await showNotice(
+			ctx,
+			"Create topic failed",
+			`${result.error}\n\nThe bot must be a group admin with 'Manage Topics' (can_manage_topics).`,
+			"error",
+		);
+		return undefined;
+	}
+	if (!result.value) return undefined;
+	const channelKey = ensureUniqueKey(
+		account.channels,
+		makeChannelKey(`${group.name ?? group.id}-${topicName.trim()}`, `${group.id}-${result.value.message_thread_id}`),
+	);
+	account.channels[channelKey] = {
+		id: group.id,
+		name: topicName.trim(),
+		threadId: result.value.message_thread_id,
+		access: { trigger: "mention", ignoreBots: true },
+	};
+	config.accounts[accountId] = account;
+	await saveChatConfig(config);
+	await showNotice(
+		ctx,
+		"Topic configured",
+		`Configured ${accountId}/${channelKey} (thread ${result.value.message_thread_id})`,
+		"info",
+	);
 	return channelKey;
 }

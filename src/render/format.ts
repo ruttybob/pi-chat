@@ -1,7 +1,6 @@
 // Formatting adapted from Vercel Chat SDK service converters (MIT).
 // Source inspiration:
 // - packages/adapter-telegram/src/markdown.ts
-// - packages/adapter-discord/src/markdown.ts
 
 import type { ChatService } from "../core/config-types.js";
 
@@ -17,16 +16,12 @@ function normalizeTelegram(markdown: string): string {
 		.trim();
 }
 
-function normalizeDiscord(markdown: string): string {
-	return markdown.replace(/(?<!<)@(\w+)/g, "<@$1>").trim();
-}
-
 export function formatMarkdownForService(service: ChatService, markdown: string): RenderedChunkPayload {
-	if (service === "telegram") return { text: normalizeTelegram(markdown), parseMode: "Markdown" };
-	return { text: normalizeDiscord(markdown) };
+	if (service !== "telegram") throw new Error(`Unsupported service: ${service}`);
+	return { text: normalizeTelegram(markdown), parseMode: "Markdown" };
 }
 
 export function maxMessageLength(service: ChatService): number {
-	if (service === "telegram") return 4096;
-	return 2000;
+	if (service !== "telegram") throw new Error(`Unsupported service: ${service}`);
+	return 4096;
 }

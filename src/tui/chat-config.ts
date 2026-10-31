@@ -11,24 +11,24 @@ import type {
 	AccessPolicy,
 	ChatAccountConfig,
 	ChatConfig,
-	DiscordAccountConfig,
 	GondolinConfig,
 	GondolinSecretConfig,
 	TelegramAccountConfig,
 } from "../core/config-types.js";
-import type { DiscoveredChannel, DiscoveredRole, DiscoveredUser, DiscoverySnapshot } from "../core/discovery-types.js";
-import { makeChannelKey } from "../core/keys.js";
+import type { DiscoveredUser, DiscoverySnapshot } from "../core/discovery-types.js";
 import { loadDiscoverySnapshot } from "../discovery-store.js";
 import { refreshAccountSnapshot, updateAccountIdentityFromSnapshot } from "../services/index.js";
 import { selectItem, showNotice, toggleItems } from "./dialogs.js";
-import { createDiscordAccountWithGuidedSetup } from "./discord-setup.js";
-import { addTelegramObservedTargetToAccount, createTelegramAccountWithGuidedSetup } from "./telegram-setup.js";
+import {
+	addTelegramObservedTargetToAccount,
+	createTelegramAccountWithGuidedSetup,
+	createTelegramTopicChannel,
+} from "./telegram-setup.js";
 
 function accountDescription(account: ChatAccountConfig, snapshot: DiscoverySnapshot | undefined): string {
 	const parts: string[] = [account.service];
 	if (account.name) parts.push(account.name);
-	if (account.service === "discord") parts.push(account.serverName);
-	else if (snapshot?.identity.userName) parts.push(`@${snapshot.identity.userName}`);
+	if (snapshot?.identity.userName) parts.push(`@${snapshot.identity.userName}`);
 	parts.push(
 		`${Object.keys(account.channels).length} configured channel${Object.keys(account.channels).length === 1 ? "" : "s"}`,
 	);
@@ -47,16 +47,6 @@ function toUserToggleItems(
 			description: user.displayName && user.displayName !== user.name ? user.name : undefined,
 		});
 	}
-	for (const id of selectedIds) if (!items.has(id)) items.set(id, { id, label: id, description: "stored id" });
-	return [...items.values()].sort((a, b) => a.label.localeCompare(b.label));
-}
-
-function toRoleToggleItems(
-	roles: DiscoveredRole[],
-	selectedIds: string[] = [],
-): Array<{ id: string; label: string; description?: string }> {
-	const items = new Map<string, { id: string; label: string; description?: string }>();
-	for (const role of roles) items.set(role.id, { id: role.id, label: role.name });
 	for (const id of selectedIds) if (!items.has(id)) items.set(id, { id, label: id, description: "stored id" });
 	return [...items.values()].sort((a, b) => a.label.localeCompare(b.label));
 }
@@ -172,7 +162,6 @@ async function promptAccessPolicy(
 			{ value: "trigger", label: `Trigger: ${policy.trigger ?? (dm ? "message" : "mention")}` },
 			{ value: "bots", label: `Ignore bots: ${(policy.ignoreBots ?? true) ? "yes" : "no"}` },
 			{ value: "users", label: `Allowed users: ${policy.allowedUserIds?.length ?? 0}` },
-			{ value: "roles", label: `Allowed roles: ${policy.allowedRoleIds?.length ?? 0}` },
 			{ value: "save", label: "Save" },
 			{ value: "cancel", label: "Cancel" },
 		]);
@@ -208,47 +197,8 @@ async function promptAccessPolicy(
 			}
 			const selected = await toggleItems(ctx, "Allowed users", items, policy.allowedUserIds ?? []);
 			if (selected) policy = { ...policy, allowedUserIds: selected.length > 0 ? selected : undefined };
-			continue;
-		}
-		if (choice === "roles") {
-			const items = toRoleToggleItems(snapshot?.roles ?? [], policy.allowedRoleIds ?? []);
-			if (items.length === 0) {
-				await showNotice(ctx, "No discovered roles", "No discovered roles available for this account.", "warning");
-				continue;
-			}
-			const selected = await toggleItems(ctx, "Allowed roles", items, policy.allowedRoleIds ?? []);
-			if (selected) policy = { ...policy, allowedRoleIds: selected.length > 0 ? selected : undefined };
 		}
 	}
-}
-
-async function configureDiscoveredChannel(
-	ctx: ExtensionContext,
-	config: ChatConfig,
-	accountId: string,
-	channel: DiscoveredChannel,
-	snapshot: DiscoverySnapshot | undefined,
-): Promise<void> {
-	const account = config.accounts[accountId];
-	if (!account) return;
-	const existingKey = Object.entries(account.channels).find(([, item]) => item.id === channel.id)?.[0];
-	const channelKey = existingKey ?? makeChannelKey(channel.name, channel.id);
-	const current = account.channels[channelKey];
-	const access = await promptAccessPolicy(
-		ctx,
-		current?.access ?? defaultAccess(channel.dm ?? false),
-		snapshot,
-		channel.dm ?? false,
-	);
-	if (!access) return;
-	account.channels[channelKey] = {
-		id: channel.id,
-		name: channel.name,
-		dm: channel.dm,
-		access,
-	};
-	await saveChatConfig(config);
-	await showNotice(ctx, "Channel configured", `Configured ${accountId}/${channelKey}`, "info");
 }
 
 async function configureConfiguredChannel(
@@ -303,67 +253,6 @@ async function configureConfiguredChannel(
 	}
 }
 
-async function configureDiscordAccount(ctx: ExtensionContext, accountId: string): Promise<void> {
-	while (true) {
-		const config = await loadChatConfig();
-		const account = config.accounts[accountId] as DiscordAccountConfig | undefined;
-		if (!account || account.service !== "discord") return;
-		const snapshot = await loadDiscoverySnapshot(accountId);
-		const configuredIds = new Set(Object.values(account.channels).map((channel) => channel.id));
-		const channelChoices = (snapshot?.channels ?? [])
-			.map((channel) => ({
-				value: channel.id,
-				label: `${configuredIds.has(channel.id) ? "●" : "○"} ${channel.name}`,
-				description: configuredIds.has(channel.id) ? "configured" : undefined,
-			}))
-			.sort((a, b) => {
-				const aConfigured = a.label.startsWith("●") ? 0 : 1;
-				const bConfigured = b.label.startsWith("●") ? 0 : 1;
-				return aConfigured - bConfigured || a.label.localeCompare(b.label);
-			});
-		const choice = await selectItem(ctx, `${accountId} (${account.serverName})`, [
-			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
-			{ value: "delete", label: "Delete account", description: "Remove account and all configured channels" },
-			{
-				value: "refresh",
-				label: "Refresh channels",
-				description: snapshot?.fetchedAt ? `Last fetched ${snapshot.fetchedAt}` : "No snapshot yet",
-			},
-			...channelChoices,
-			{ value: "back", label: "Back" },
-		]);
-		if (!choice || choice === "back") return;
-		if (choice === "secrets") {
-			await configureSecrets(ctx, `${accountId} secrets`, account.gondolin, async (next) => {
-				account.gondolin = next;
-				config.accounts[accountId] = account;
-				await saveChatConfig(config);
-			});
-			continue;
-		}
-		if (choice === "delete") {
-			const ok = await ctx.ui.confirm("Delete account", `Delete ${accountId} and all configured channels?`);
-			if (!ok) continue;
-			delete config.accounts[accountId];
-			await saveChatConfig(config);
-			await removeAccountStorage(accountId, ctx.cwd);
-			await showNotice(ctx, "Account deleted", `Deleted ${accountId}`, "info");
-			return;
-		}
-		if (choice === "refresh") {
-			const fresh = await refreshAccountSnapshot(accountId, account);
-			config.accounts[accountId] = updateAccountIdentityFromSnapshot(account, fresh);
-			await saveChatConfig(config);
-			if ((fresh.warnings?.length ?? 0) > 0) {
-				await showNotice(ctx, "Refresh warnings", (fresh.warnings ?? []).join("\n"), "warning");
-			}
-			continue;
-		}
-		const selectedChannel = snapshot?.channels.find((channel) => channel.id === choice);
-		if (selectedChannel) await configureDiscoveredChannel(ctx, config, accountId, selectedChannel, snapshot);
-	}
-}
-
 async function configureTelegramAccount(ctx: ExtensionContext, accountId: string): Promise<void> {
 	while (true) {
 		const config = await loadChatConfig();
@@ -372,12 +261,24 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 		const channelChoices = Object.entries(account.channels).map(([key, channel]) => ({
 			value: key,
 			label: key,
-			description: `${channel.name ?? channel.id}${channel.dm ? " • dm" : " • group"}`,
+			description: `${channel.name ?? channel.id}${
+				channel.dm ? " • dm" : channel.threadId !== undefined ? ` • topic ${channel.threadId}` : " • group"
+			}`,
 		}));
 		const choice = await selectItem(ctx, `${accountId} (@${account.botUsername ?? "bot"})`, [
 			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
 			{ value: "add-dm", label: "Add DM", description: "Pair a DM by sending /start to the bot" },
 			{ value: "add-group", label: "Add group", description: "Observe activity after adding the bot to a group" },
+			{
+				value: "add-topic",
+				label: "Add topic (observe)",
+				description: "Post any message in a forum topic; its thread id gets picked up",
+			},
+			{
+				value: "create-topic",
+				label: "Create topic (bot)",
+				description: 'Bot creates a topic (needs admin right "Manage Topics")',
+			},
 			{ value: "refresh", label: "Refresh bot info" },
 			{ value: "delete", label: "Delete account", description: "Remove account and all configured channels" },
 			...channelChoices,
@@ -398,6 +299,14 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 		}
 		if (choice === "add-group") {
 			await addTelegramObservedTargetToAccount(ctx, config, accountId, account, "group");
+			continue;
+		}
+		if (choice === "add-topic") {
+			await addTelegramObservedTargetToAccount(ctx, config, accountId, account, "topic");
+			continue;
+		}
+		if (choice === "create-topic") {
+			await createTelegramTopicChannel(ctx, config, accountId, account);
 			continue;
 		}
 		if (choice === "refresh") {
@@ -423,7 +332,6 @@ async function configureAccount(ctx: ExtensionContext, accountId: string): Promi
 	const config = await loadChatConfig();
 	const account = config.accounts[accountId];
 	if (!account) return;
-	if (account.service === "discord") return configureDiscordAccount(ctx, accountId);
 	if (account.service === "telegram") return configureTelegramAccount(ctx, accountId);
 }
 
@@ -446,7 +354,7 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 				label: accountId,
 				description: accountDescription(config.accounts[accountId], snapshot),
 			})),
-			{ value: "__create__", label: "+ Create account", description: "Create a Telegram or Discord account" },
+			{ value: "__create__", label: "+ Create account", description: "Create a Telegram bot account" },
 		]);
 		if (!choice) return;
 		if (choice === "__secrets__") {
@@ -457,17 +365,7 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 			continue;
 		}
 		if (choice === "__create__") {
-			const serviceChoice = await selectItem(ctx, "Create account", [
-				{ value: "telegram", label: "Telegram" },
-				{ value: "discord", label: "Discord" },
-			]);
-			if (!serviceChoice) continue;
-			if (serviceChoice === "telegram") {
-				const accountId = await createTelegramAccountWithGuidedSetup(ctx, config);
-				if (accountId) await configureAccount(ctx, accountId);
-				continue;
-			}
-			const accountId = await createDiscordAccountWithGuidedSetup(ctx, config);
+			const accountId = await createTelegramAccountWithGuidedSetup(ctx, config);
 			if (accountId) await configureAccount(ctx, accountId);
 			continue;
 		}

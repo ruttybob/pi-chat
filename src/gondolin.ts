@@ -1,9 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { constants as fsConstants, realpathSync } from "node:fs";
+import { accessSync, constants as fsConstants, mkdirSync, realpathSync } from "node:fs";
 import { access, mkdir, open, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
-import { createHttpHooks, RealFSProvider, type SecretDefinition, VM } from "@earendil-works/gondolin";
+import {
+	createHttpHooks,
+	type HttpHooks,
+	ReadonlyProvider,
+	RealFSProvider,
+	type SecretDefinition,
+	VM,
+} from "@earendil-works/gondolin";
 
 import type { ResolvedConversation } from "./core/config-types.js";
 import { ensureConversationDirs } from "./log.js";
@@ -26,21 +34,82 @@ function guestMountRoot(guestPath: string): typeof GONDOLIN_WORKSPACE | typeof G
 	return undefined;
 }
 
+interface GuestMount {
+	guestPrefix: string;
+	hostDir: string;
+	readOnly: boolean;
+}
+
+function expandHostMountPath(value: string): string {
+	const trimmed = value.trim();
+	const expanded = trimmed.startsWith("~/") ? path.join(os.homedir(), trimmed.slice(2)) : trimmed;
+	return path.resolve(expanded);
+}
+
+function resolveExtraMounts(conversation: ResolvedConversation): GuestMount[] {
+	const configured = conversation.channel.gondolin?.mounts ?? [];
+	const extra: GuestMount[] = [];
+	for (const mount of configured) {
+		const hostDir = expandHostMountPath(mount.hostPath);
+		try {
+			accessSync(hostDir);
+		} catch {
+			throw new Error(`Mount hostPath does not exist: ${hostDir}`);
+		}
+		const guestPrefix = path.posix.normalize(
+			mount.guestPath?.trim() || `${GONDOLIN_WORKSPACE}/${path.basename(hostDir)}`,
+		);
+		if (!guestMountRoot(guestPrefix)) {
+			throw new Error(`Mount guest path must be under ${GONDOLIN_WORKSPACE} or ${GONDOLIN_SHARED}: ${guestPrefix}`);
+		}
+		extra.push({ guestPrefix, hostDir: realpathSync(hostDir), readOnly: mount.readOnly ?? true });
+	}
+	return extra;
+}
+
 function resolveSecretEnvironment(conversation: ResolvedConversation): {
 	env?: Record<string, string>;
 	httpHooks?: ReturnType<typeof createHttpHooks>["httpHooks"];
 	configuredSecretNames: string[];
 } {
-	const configuredSecretNames = Object.keys(conversation.gondolinSecrets);
-	if (configuredSecretNames.length === 0) return { configuredSecretNames };
 	const secrets: Record<string, SecretDefinition> = {};
+	const configuredSecretNames: string[] = [];
 	for (const [name, secret] of Object.entries(conversation.gondolinSecrets)) {
 		if (!secret.value.trim()) throw new Error(`Gondolin secret ${name} must have a value`);
 		if (secret.hosts.length === 0) throw new Error(`Gondolin secret ${name} must declare at least one host`);
 		secrets[name] = { hosts: [...secret.hosts], value: secret.value };
+		configuredSecretNames.push(name);
 	}
-	const { env, httpHooks } = createHttpHooks({ allowedHosts: ["*"], secrets });
-	return { env, httpHooks, configuredSecretNames };
+	// Auto-provision the Telegram bot token: the agent calls the Bot API via the env
+	// placeholder (create topics etc.); the real value never enters the VM.
+	const account = conversation.account;
+	if (account.service === "telegram" && !secrets.bot_token && account.botToken.trim()) {
+		secrets.bot_token = { hosts: ["api.telegram.org"], value: account.botToken.trim() };
+		configuredSecretNames.push("bot_token");
+	}
+	if (configuredSecretNames.length === 0) return { configuredSecretNames };
+	const base = createHttpHooks({ allowedHosts: ["*"], secrets });
+	const placeholder = base.env.bot_token;
+	if (!placeholder) return { env: base.env, httpHooks: base.httpHooks, configuredSecretNames };
+	// Gondolin substitutes placeholders in headers and query strings only; the
+	// Telegram token lives in the URL path (/bot<token>/METHOD), so rewrite it here.
+	const botToken = secrets.bot_token.value;
+	const rewriteBotTokenPath: HttpHooks["onRequest"] = async (request) => {
+		if (!request.url.includes(placeholder)) return undefined;
+		const parsed = new URL(request.url);
+		if (parsed.hostname.toLowerCase() !== "api.telegram.org") return undefined;
+		const nextUrl = parsed.toString().split(placeholder).join(botToken);
+		const method = request.method.toUpperCase();
+		const canHaveBody = method !== "GET" && method !== "HEAD";
+		return new Request(nextUrl, {
+			method,
+			headers: request.headers,
+			body: canHaveBody ? request.body : undefined,
+			...(canHaveBody && request.body ? { duplex: "half" } : {}),
+		});
+	};
+	const wrapped = createHttpHooks({ allowedHosts: ["*"], secrets, onRequest: rewriteBotTokenPath });
+	return { env: wrapped.env, httpHooks: wrapped.httpHooks, configuredSecretNames };
 }
 
 async function walk(
@@ -73,6 +142,8 @@ export class ConversationSandbox {
 		this.starting = (async () => {
 			await ensureConversationDirs(this.conversation);
 			const secretConfig = resolveSecretEnvironment(this.conversation);
+			const extraMounts = resolveExtraMounts(this.conversation);
+			for (const mount of extraMounts) mkdirSync(mount.hostDir, { recursive: true });
 			const vm = await VM.create({
 				sessionLabel: `pi-chat ${this.conversation.conversationName}`,
 				env: secretConfig.env,
@@ -81,6 +152,12 @@ export class ConversationSandbox {
 					mounts: {
 						[GONDOLIN_WORKSPACE]: new RealFSProvider(this.conversation.workspaceDir),
 						[GONDOLIN_SHARED]: new RealFSProvider(this.conversation.sharedDir),
+						...Object.fromEntries(
+							extraMounts.map((mount) => {
+								const provider = new RealFSProvider(mount.hostDir);
+								return [mount.guestPrefix, mount.readOnly ? new ReadonlyProvider(provider) : provider];
+							}),
+						),
 					},
 				},
 			});
@@ -109,8 +186,14 @@ export class ConversationSandbox {
 		if (!trimmed) throw new Error("Path must not be empty");
 		const base = trimmed.startsWith("/") ? "/" : GONDOLIN_WORKSPACE;
 		const guestPath = path.posix.resolve(base, trimmed);
-		if (!guestMountRoot(guestPath)) throw new Error(`Path is outside mounted storage: ${inputPath}`);
-		return guestPath;
+		if (guestMountRoot(guestPath)) return guestPath;
+		if (resolveExtraMounts(this.conversation).some((mount) => this.isUnderPrefix(guestPath, mount.guestPrefix)))
+			return guestPath;
+		throw new Error(`Path is outside mounted storage: ${inputPath}`);
+	}
+
+	private isUnderPrefix(guestPath: string, prefix: string): boolean {
+		return guestPath === prefix || guestPath.startsWith(`${prefix}/`);
 	}
 
 	async stageAttachment(inputPath: string): Promise<string> {
@@ -134,48 +217,48 @@ export class ConversationSandbox {
 		return this.resolveGuestPath(inputPath);
 	}
 
+	private baseMounts(): GuestMount[] {
+		return [
+			{ guestPrefix: GONDOLIN_WORKSPACE, hostDir: this.conversation.workspaceDir, readOnly: false },
+			{ guestPrefix: GONDOLIN_SHARED, hostDir: this.conversation.sharedDir, readOnly: false },
+		];
+	}
+
+	private mountTable(): GuestMount[] {
+		// Longest prefix first so nested extra mounts win over /workspace.
+		return [...this.baseMounts(), ...resolveExtraMounts(this.conversation)].sort(
+			(a, b) => b.guestPrefix.length - a.guestPrefix.length,
+		);
+	}
+
 	guestToHostPath(inputPath: string): string {
 		const guestPath = this.resolveGuestPath(inputPath);
-		const mountRoot = guestMountRoot(guestPath);
-		let hostRoot: string;
-		let hostPath: string;
-		if (mountRoot === GONDOLIN_WORKSPACE) {
-			const relativePath = path.posix.relative(GONDOLIN_WORKSPACE, guestPath);
-			hostRoot = this.conversation.workspaceDir;
-			hostPath = path.join(hostRoot, ...relativePath.split("/").filter(Boolean));
-		} else if (mountRoot === GONDOLIN_SHARED) {
-			const relativePath = path.posix.relative(GONDOLIN_SHARED, guestPath);
-			hostRoot = this.conversation.sharedDir;
-			hostPath = path.join(hostRoot, ...relativePath.split("/").filter(Boolean));
-		} else {
-			throw new Error(`Path is outside mounted storage: ${inputPath}`);
-		}
-		const resolvedRoot = realpathSync(hostRoot);
+		const mount = this.mountTable().find((entry) => this.isUnderPrefix(guestPath, entry.guestPrefix));
+		if (!mount) throw new Error(`Path is outside mounted storage: ${inputPath}`);
+		const hostRoot = realpathSync(mount.hostDir);
+		const relativePath = path.posix.relative(mount.guestPrefix, guestPath);
+		const hostPath = path.join(hostRoot, ...relativePath.split("/").filter(Boolean));
 		const resolvedHostPath = realpathSync(hostPath);
-		if (!isInside(resolvedRoot, resolvedHostPath)) throw new Error(`Path is outside mounted storage: ${inputPath}`);
+		if (!isInside(hostRoot, resolvedHostPath)) throw new Error(`Path is outside mounted storage: ${inputPath}`);
 		return resolvedHostPath;
 	}
 
 	private assertMountedHostPath(hostPath: string): string {
 		const resolved = realpathSync(hostPath);
-		const workspaceRoot = realpathSync(this.conversation.workspaceDir);
-		if (isInside(workspaceRoot, resolved)) return resolved;
-		const sharedRoot = realpathSync(this.conversation.sharedDir);
-		if (isInside(sharedRoot, resolved)) return resolved;
+		for (const mount of this.mountTable()) {
+			const hostRoot = realpathSync(mount.hostDir);
+			if (isInside(hostRoot, resolved)) return resolved;
+		}
 		throw new Error(`Path is outside mounted storage: ${hostPath}`);
 	}
 
 	hostToGuestPath(hostPath: string): string {
 		const resolved = this.assertMountedHostPath(hostPath);
-		const workspaceRoot = realpathSync(this.conversation.workspaceDir);
-		if (isInside(workspaceRoot, resolved)) {
-			const relativePath = toPosix(path.relative(workspaceRoot, resolved));
-			return relativePath ? path.posix.join(GONDOLIN_WORKSPACE, relativePath) : GONDOLIN_WORKSPACE;
-		}
-		const sharedRoot = realpathSync(this.conversation.sharedDir);
-		if (isInside(sharedRoot, resolved)) {
-			const relativePath = toPosix(path.relative(sharedRoot, resolved));
-			return relativePath ? path.posix.join(GONDOLIN_SHARED, relativePath) : GONDOLIN_SHARED;
+		for (const mount of this.mountTable()) {
+			const hostRoot = realpathSync(mount.hostDir);
+			if (!isInside(hostRoot, resolved)) continue;
+			const relativePath = toPosix(path.relative(hostRoot, resolved));
+			return relativePath ? path.posix.join(mount.guestPrefix, relativePath) : mount.guestPrefix;
 		}
 		throw new Error(`Path is outside mounted storage: ${hostPath}`);
 	}

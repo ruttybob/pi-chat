@@ -6,6 +6,7 @@ import type {
 	AttachmentKind,
 	ChatLogRecord,
 	InboundMessageInput,
+	InboundMessageRecord,
 	ResolvedConversation,
 	StoredAttachment,
 } from "../types.js";
@@ -190,4 +191,118 @@ export function normalizeInboundMessage(input: InboundMessageInput, botName: str
 	const text = input.text.trim();
 	const mentionPattern = new RegExp(`@${botName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
 	return { ...input, text, mentionedBot: input.mentionedBot ?? mentionPattern.test(text), isBot: input.isBot ?? false };
+}
+
+const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+export async function acquireFileLock(path: string, owner: string): Promise<boolean> {
+	try {
+		const handle = await open(path, "wx");
+		try {
+			await handle.writeFile(`${owner}\n`, "utf8");
+		} finally {
+			await handle.close();
+		}
+		return true;
+	} catch (error) {
+		const code =
+			error && typeof error === "object" && "code" in error ? String((error as { code?: string }).code) : undefined;
+		if (code !== "EEXIST") throw error;
+	}
+	const existingOwner = (await readFile(path, "utf8").catch(() => "")).trim();
+	const existingPid = extractOwnerPid(existingOwner);
+	if (existingPid === undefined || isPidAlive(existingPid)) return false;
+	await unlink(path).catch(() => undefined);
+	try {
+		const handle = await open(path, "wx");
+		try {
+			await handle.writeFile(`${owner}\n`, "utf8");
+		} finally {
+			await handle.close();
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export async function releaseFileLock(path: string): Promise<void> {
+	await unlink(path).catch(() => undefined);
+}
+
+export async function readLogTailRecords(logPath: string, bytes = 16384): Promise<ChatLogRecord[]> {
+	try {
+		const handle = await open(logPath, "r");
+		try {
+			const size = (await handle.stat()).size;
+			const start = Math.max(0, size - bytes);
+			const buffer = Buffer.alloc(size - start);
+			await handle.read(buffer, 0, buffer.length, start);
+			const lines = buffer.toString("utf8").split("\n").filter(Boolean);
+			if (start > 0) lines.shift();
+			const records: ChatLogRecord[] = [];
+			for (const line of lines) {
+				try {
+					records.push(JSON.parse(line) as ChatLogRecord);
+				} catch {
+					// Skip malformed tail lines.
+				}
+			}
+			return records;
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return [];
+	}
+}
+
+export async function withAppendLock<T>(
+	conversation: ResolvedConversation,
+	owner: string,
+	fn: () => Promise<T>,
+): Promise<T> {
+	const path = `${conversation.lockPath}.append`;
+	for (let attempt = 0; ; attempt++) {
+		if (await acquireFileLock(path, owner)) {
+			try {
+				return await fn();
+			} finally {
+				await releaseFileLock(path);
+			}
+		}
+		if (attempt >= 100) throw new Error(`Append lock busy: ${path}`);
+		await sleep(20);
+	}
+}
+
+// Remote inbound from the account feed leader: allocates a recordId under the
+// append lock so the conversation worker (a different process) can absorb it later.
+export async function appendRemoteInbound(
+	conversation: ResolvedConversation,
+	owner: string,
+	input: InboundMessageInput,
+): Promise<InboundMessageRecord | undefined> {
+	return withAppendLock(conversation, owner, async () => {
+		const tail = await readLogTailRecords(conversation.logPath);
+		if (input.messageId && tail.some((record) => record.type === "inbound" && record.messageId === input.messageId))
+			return undefined;
+		const maxId = tail.reduce((max, record) => Math.max(max, record.recordId), 0);
+		const normalized = normalizeInboundMessage(input, conversation.botName);
+		const messageId = normalized.messageId || nextMessageId(conversation.service);
+		const attachments = await materializeAttachments(conversation, messageId, normalized.attachments);
+		const record: InboundMessageRecord = {
+			type: "inbound",
+			...buildBaseRecordFields(conversation, maxId + 1),
+			messageId,
+			userId: normalized.userId,
+			userName: normalized.userName,
+			text: normalized.text,
+			mentionedBot: normalized.mentionedBot ?? false,
+			isBot: normalized.isBot ?? false,
+			attachments,
+		};
+		await appendConversationRecord(conversation, record);
+		return record;
+	});
 }

@@ -21,11 +21,6 @@ export interface DiscoveredUser {
 	isBot?: boolean;
 }
 
-export interface DiscoveredRole {
-	id: string;
-	name: string;
-}
-
 export interface DiscoverySnapshot {
 	accountId: string;
 	service: ChatService;
@@ -33,12 +28,10 @@ export interface DiscoverySnapshot {
 	identity: AccountIdentity;
 	channels: DiscoveredChannel[];
 	users: DiscoveredUser[];
-	roles: DiscoveredRole[];
 	warnings?: string[];
 	capabilities?: {
 		canListChannels?: boolean;
 		canListUsers?: boolean;
-		canListRoles?: boolean;
 	};
 }
 

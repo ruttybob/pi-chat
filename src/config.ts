@@ -20,7 +20,7 @@ function sanitizePathSegment(value: string): string {
 	return value.replace(/[^a-zA-Z0-9._-]+/g, "_");
 }
 
-function getAccountStorageDir(accountId: string): string {
+export function getAccountStorageDir(accountId: string): string {
 	return join(CHAT_HOME, "accounts", sanitizePathSegment(accountId));
 }
 
@@ -35,7 +35,6 @@ function mergeAccess(...policies: Array<AccessPolicy | undefined>): AccessPolicy
 		if (policy.trigger !== undefined) merged.trigger = policy.trigger;
 		if (policy.ignoreBots !== undefined) merged.ignoreBots = policy.ignoreBots;
 		if (policy.allowedUserIds !== undefined) merged.allowedUserIds = [...policy.allowedUserIds];
-		if (policy.allowedRoleIds !== undefined) merged.allowedRoleIds = [...policy.allowedRoleIds];
 	}
 	return merged;
 }
@@ -68,6 +67,7 @@ function buildResolvedConversation(
 		account,
 		channelKey,
 		channel,
+		threadId: channel.threadId,
 		conversationId: `${accountId}/${channelKey}`,
 		conversationName: `${account.name ?? accountId} / ${channel.name ?? channelKey}`,
 		access: mergeAccess(account.access, channel.access),
@@ -109,10 +109,20 @@ export async function loadChatConfig(): Promise<ChatConfig> {
 	try {
 		const content = await readFile(CHAT_CONFIG_PATH, "utf8");
 		const parsed = JSON.parse(content) as ChatConfig;
+		const accounts: Record<string, ChatAccountConfig> = {};
+		for (const [key, account] of Object.entries(parsed.accounts ?? {})) {
+			if (account?.service !== "telegram") {
+				console.warn(
+					`[pi-chat] dropping account "${key}" (service: ${String(account?.service)}) — Discord support was removed`,
+				);
+				continue;
+			}
+			accounts[key] = account;
+		}
 		return {
 			botName: parsed.botName?.trim() || "pi",
 			gondolin: parsed.gondolin,
-			accounts: (parsed.accounts ?? {}) as Record<string, ChatAccountConfig>,
+			accounts,
 		};
 	} catch {
 		return { botName: "pi", accounts: {} };

@@ -24,7 +24,6 @@ export interface InboundMessageInput {
 	messageId?: string;
 	userId: string;
 	userName?: string;
-	roleIds?: string[];
 	text: string;
 	mentionedBot?: boolean;
 	isBot?: boolean;
@@ -46,7 +45,6 @@ export interface InboundMessageRecord extends ChatRecordBase {
 	messageId: string;
 	userId: string;
 	userName?: string;
-	roleIds?: string[];
 	text: string;
 	mentionedBot: boolean;
 	isBot: boolean;

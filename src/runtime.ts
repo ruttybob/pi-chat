@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 
 import type {
 	ChatLogRecord,
-	CheckpointRecord,
 	ConversationStatus,
 	DispatchableJob,
 	InboundMessageInput,
@@ -20,7 +19,9 @@ import {
 	nextMessageId,
 	normalizeInboundMessage,
 	readConversationLog,
+	readLogTailRecords,
 	releaseConversationLock,
+	withAppendLock,
 } from "./log.js";
 
 function isDMConversation(conversation: ResolvedConversation): boolean {
@@ -103,10 +104,18 @@ export class ConversationRuntime {
 		await releaseConversationLock(this.conversation);
 	}
 
-	private async appendRecord(record: ChatLogRecord): Promise<void> {
-		this.records.push(record);
-		this.nextRecordId = Math.max(this.nextRecordId, record.recordId + 1);
-		await appendConversationRecord(this.conversation, record);
+	// Single-writer guarantee: the account feed leader (another process) also appends
+	// remote inbound records, so allocate recordId under the append lock from the log tail.
+	private async appendRecord(record: ChatLogRecord): Promise<ChatLogRecord> {
+		return withAppendLock(this.conversation, this.ownerId, async () => {
+			const tail = await readLogTailRecords(this.conversation.logPath);
+			const tailMax = tail.reduce((max, item) => Math.max(max, item.recordId), 0);
+			const stored: ChatLogRecord = { ...record, recordId: Math.max(tailMax + 1, this.nextRecordId) };
+			this.records.push(stored);
+			this.nextRecordId = stored.recordId + 1;
+			await appendConversationRecord(this.conversation, stored);
+			return stored;
+		});
 	}
 
 	private getLastQueuedTriggerRecordId(): number {
@@ -126,14 +135,10 @@ export class ConversationRuntime {
 		return last;
 	}
 
-	private isAllowedInput(message: Pick<InboundMessageInput, "userId" | "roleIds" | "isBot">): boolean {
+	private isAllowedInput(message: Pick<InboundMessageInput, "userId" | "isBot">): boolean {
 		const access = this.conversation.access;
 		if ((message.isBot ?? false) && (access.ignoreBots ?? true)) return false;
 		if (access.allowedUserIds?.length && !access.allowedUserIds.includes(message.userId)) return false;
-		if (access.allowedRoleIds?.length) {
-			const roleIds = message.roleIds ?? [];
-			if (!roleIds.some((roleId) => access.allowedRoleIds?.includes(roleId))) return false;
-		}
 		return true;
 	}
 
@@ -176,64 +181,64 @@ export class ConversationRuntime {
 		return recordId > Math.max(this.armedAfterRecordId, this.getLastQueuedTriggerRecordId());
 	}
 
-	getLastCheckpoint(): { cursor?: string; messageId?: string } {
-		for (let index = this.records.length - 1; index >= 0; index--) {
-			const record = this.records[index];
-			if (record?.type === "checkpoint") return { cursor: record.cursor, messageId: record.messageId };
-		}
-		return {};
-	}
-
-	async noteCheckpoint(checkpoint: { cursor?: string; messageId?: string }): Promise<void> {
-		const previous = this.getLastCheckpoint();
-		if (previous.cursor === checkpoint.cursor && previous.messageId === checkpoint.messageId) return;
-		const record: CheckpointRecord = {
-			type: "checkpoint",
-			...buildBaseRecordFields(this.conversation, this.nextRecordId),
-			cursor: checkpoint.cursor,
-			messageId: checkpoint.messageId,
-		};
-		await this.appendRecord(record);
-	}
-
-	async ingestInbound(
-		input: InboundMessageInput,
-		checkpoint?: { cursor?: string; messageId?: string },
-	): Promise<{ record: InboundMessageRecord; jobQueued: boolean }> {
-		const normalized = normalizeInboundMessage(input, this.conversation.botName);
-		const messageId = normalized.messageId || nextMessageId(this.conversation.service);
-		const attachments = await materializeAttachments(this.conversation, messageId, normalized.attachments);
-		const record: InboundMessageRecord = {
-			type: "inbound",
-			...buildBaseRecordFields(this.conversation, this.nextRecordId),
-			messageId,
-			userId: normalized.userId,
-			userName: normalized.userName,
-			roleIds: normalized.roleIds,
-			text: normalized.text,
-			mentionedBot: normalized.mentionedBot ?? false,
-			isBot: normalized.isBot ?? false,
-			attachments,
-		};
-		await this.appendRecord(record);
-		if (checkpoint) await this.noteCheckpoint(checkpoint);
+	private async queueTrigger(record: InboundMessageRecord): Promise<boolean> {
 		const trigger = this.shouldTriggerJob(record);
-		if (!trigger || !this.shouldQueueTrigger(record.recordId)) return { record, jobQueued: false };
-		const queuedRecord: JobQueuedRecord = {
+		if (!trigger || !this.shouldQueueTrigger(record.recordId)) return false;
+		const queuedRecord = (await this.appendRecord({
 			type: "job_queued",
-			...buildBaseRecordFields(this.conversation, this.nextRecordId),
+			...buildBaseRecordFields(this.conversation, 0),
 			jobId: randomUUID(),
 			trigger,
 			triggerRecordId: record.recordId,
-		};
-		await this.appendRecord(queuedRecord);
+		})) as JobQueuedRecord;
 		this.pendingJobs.push({
 			jobId: queuedRecord.jobId,
 			trigger: queuedRecord.trigger,
 			triggerRecordId: queuedRecord.triggerRecordId,
 			queuedRecordId: queuedRecord.recordId,
 		});
-		return { record, jobQueued: true };
+		return true;
+	}
+
+	async ingestInbound(input: InboundMessageInput): Promise<{ record: InboundMessageRecord; jobQueued: boolean }> {
+		const normalized = normalizeInboundMessage(input, this.conversation.botName);
+		const messageId = normalized.messageId || nextMessageId(this.conversation.service);
+		const attachments = await materializeAttachments(this.conversation, messageId, normalized.attachments);
+		const stored = (await this.appendRecord({
+			type: "inbound",
+			...buildBaseRecordFields(this.conversation, 0),
+			messageId,
+			userId: normalized.userId,
+			userName: normalized.userName,
+			text: normalized.text,
+			mentionedBot: normalized.mentionedBot ?? false,
+			isBot: normalized.isBot ?? false,
+			attachments,
+		})) as InboundMessageRecord;
+		const jobQueued = await this.queueTrigger(stored);
+		return { record: stored, jobQueued };
+	}
+
+	// Absorb records appended by the account feed leader (remote inbound for this
+	// conversation). Returns true when new jobs were queued.
+	async absorbExternalRecords(): Promise<boolean> {
+		const fresh = await readConversationLog(this.conversation);
+		if (fresh.length <= this.records.length) return false;
+		const known = new Set(this.records.map((record) => record.recordId));
+		const incoming = fresh.filter(
+			(record): record is InboundMessageRecord => record.type === "inbound" && !known.has(record.recordId),
+		);
+		this.records = fresh;
+		this.nextRecordId = Math.max(
+			this.nextRecordId,
+			fresh.reduce((max, record) => Math.max(max, record.recordId), 0) + 1,
+		);
+		let changed = false;
+		for (const record of incoming) {
+			if (record.type !== "inbound") continue;
+			if (await this.queueTrigger(record)) changed = true;
+		}
+		return changed;
 	}
 
 	beginNextJob(): DispatchableJob | undefined {
@@ -263,21 +268,20 @@ export class ConversationRuntime {
 		const trimmed = text.trim();
 		if (trimmed.length > 0 || (attachmentPaths?.length ?? 0) > 0) {
 			const triggerRecord = getLatestTriggerRecord(this.records, job);
-			const outbound = {
+			const outbound = (await this.appendRecord({
 				type: "outbound",
-				...buildBaseRecordFields(this.conversation, this.nextRecordId),
+				...buildBaseRecordFields(this.conversation, 0),
 				messageId: remoteMessageId || nextMessageId(this.conversation.service),
 				text: trimmed,
 				replyToMessageId: triggerRecord?.messageId,
 				jobId: job.jobId,
 				attachments: attachmentPaths?.length ? [...attachmentPaths] : undefined,
-			} as const;
+			})) as { recordId: number };
 			outboundRecordId = outbound.recordId;
-			await this.appendRecord(outbound);
 		}
 		await this.appendRecord({
 			type: "job_completed",
-			...buildBaseRecordFields(this.conversation, this.nextRecordId),
+			...buildBaseRecordFields(this.conversation, 0),
 			jobId: job.jobId,
 			triggerRecordId: job.triggerRecordId,
 			outboundRecordId,
@@ -290,7 +294,7 @@ export class ConversationRuntime {
 		if (!job) return;
 		await this.appendRecord({
 			type: "job_failed",
-			...buildBaseRecordFields(this.conversation, this.nextRecordId),
+			...buildBaseRecordFields(this.conversation, 0),
 			jobId: job.jobId,
 			triggerRecordId: job.triggerRecordId,
 			error,
@@ -299,7 +303,7 @@ export class ConversationRuntime {
 	}
 
 	async appendError(message: string): Promise<void> {
-		await this.appendRecord({ type: "error", ...buildBaseRecordFields(this.conversation, this.nextRecordId), message });
+		await this.appendRecord({ type: "error", ...buildBaseRecordFields(this.conversation, 0), message });
 	}
 
 	findHistory(options: { query?: string; after?: string; before?: string; limit?: number }): Array<ChatLogRecord> {

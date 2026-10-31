@@ -1,4 +1,4 @@
-export type ChatService = "telegram" | "discord";
+export type ChatService = "telegram";
 
 export type TriggerMode = "mention" | "message";
 
@@ -6,7 +6,6 @@ export interface AccessPolicy {
 	trigger?: TriggerMode;
 	ignoreBots?: boolean;
 	allowedUserIds?: string[];
-	allowedRoleIds?: string[];
 }
 
 export interface GondolinSecretConfig {
@@ -14,14 +13,28 @@ export interface GondolinSecretConfig {
 	hosts: string[];
 }
 
+export interface GondolinMountConfig {
+	/** Absolute host directory to expose inside the VM (~ is expanded). */
+	hostPath: string;
+	/** Guest path; default /workspace/<folder name> (must be under /workspace or /shared). */
+	guestPath?: string;
+	/** Default true — the VM cannot write to the host folder. */
+	readOnly?: boolean;
+}
+
 export interface GondolinConfig {
 	secrets?: Record<string, GondolinSecretConfig>;
+	mounts?: GondolinMountConfig[];
 }
 
 export interface ConfiguredChannel {
 	id: string;
 	name?: string;
 	dm?: boolean;
+	/** Forum topic (message_thread_id) in a supergroup with Topics enabled; General = 1. */
+	threadId?: number;
+	/** Tool whitelist for remote turns; undefined = all tools allowed. */
+	tools?: string[];
 	access?: AccessPolicy;
 	gondolin?: GondolinConfig;
 }
@@ -41,17 +54,7 @@ export interface TelegramAccountConfig extends BaseAccountConfig {
 	botUserId?: string;
 }
 
-export interface DiscordAccountConfig extends BaseAccountConfig {
-	service: "discord";
-	botToken: string;
-	applicationId: string;
-	serverId: string;
-	serverName: string;
-	botUserId?: string;
-	botUsername?: string;
-}
-
-export type ChatAccountConfig = TelegramAccountConfig | DiscordAccountConfig;
+export type ChatAccountConfig = TelegramAccountConfig;
 
 export interface ChatConfig {
 	botName?: string;
@@ -66,6 +69,7 @@ export interface ResolvedConversation {
 	account: ChatAccountConfig;
 	channelKey: string;
 	channel: ConfiguredChannel;
+	threadId?: number;
 	conversationId: string;
 	conversationName: string;
 	access: AccessPolicy;

@@ -16,3 +16,10 @@ export function makeAccountKey(service: ChatService, label: string): string {
 export function makeChannelKey(label: string, fallbackId: string): string {
 	return slugify(label) || fallbackId;
 }
+
+export function ensureUniqueKey(existing: Record<string, unknown>, base: string): string {
+	if (!existing[base]) return base;
+	let index = 2;
+	while (existing[`${base}-${index}`]) index += 1;
+	return `${base}-${index}`;
+}

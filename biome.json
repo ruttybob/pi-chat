@@ -6,6 +6,9 @@
 		"indentStyle": "tab",
 		"lineWidth": 120
 	},
+	"files": {
+		"includes": ["**", "!.pi"]
+	},
 	"linter": {
 		"enabled": true,
 		"rules": {

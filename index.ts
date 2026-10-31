@@ -25,12 +25,17 @@ import {
 	listConfiguredConversations,
 	loadChatConfig,
 	resolveConversation,
+	saveChatConfig,
 } from "./src/config.js";
 
-import type { ResolvedConversation } from "./src/core/config-types.js";
+import type { ResolvedConversation, TelegramAccountConfig } from "./src/core/config-types.js";
+import { ensureUniqueKey, makeChannelKey } from "./src/core/keys.js";
+import type { InboundMessageInput } from "./src/core/runtime-types.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
+import { type AccountFeed, startAccountFeed } from "./src/live/feed.js";
 import { connectLive } from "./src/live/index.js";
 import type { LiveConnection } from "./src/live/types.js";
+import { appendRemoteInbound } from "./src/log.js";
 import { ConversationRuntime } from "./src/runtime.js";
 import { createSecretRequest, tryDecryptSecret } from "./src/secrets.js";
 import { runChatConfigUI } from "./src/tui/chat-config.js";
@@ -78,7 +83,7 @@ Attachments in the transcript are local file paths. Read them as needed.
 To send files back, write them under /workspace and use chat_attach.
 Use chat_history to look up older messages when needed.
 
-Your response is sent as the bot's reply to the remote chat.`;
+Your response is sent as the bot's reply to the remote chat.\n\nTelegram Bot API:\n- The bot token is exposed as the $bot_token env var. Never print or echo it.\n- Call the API from the VM, e.g.: curl -s "https://api.telegram.org/bot\${bot_token}/getChat" -d '{"chat_id": 123}'\n- You can manage topics in configured forum groups: createForumTopic (needs the bot to have "Manage Topics" admin rights). New topics are registered as channels automatically.`;
 }
 
 type AssistantSummary = {
@@ -94,6 +99,8 @@ type PersistedChatState = {
 const SESSION_STATE_CUSTOM_TYPE = "pi-chat-state";
 const CHAT_CONVERSATION_FLAG = "chat-conversation";
 const WORKER_TMUX_PREFIX = "pi-chat-worker-";
+// Direct chat tools: declared to the model only while a conversation is connected.
+const CHAT_TOOLS = ["chat_history", "chat_attach", "chat_workers", "chat_request_secret"];
 const DASHBOARD_TMUX_SESSION = "pi-chat-dashboard";
 const WORKER_STATUS_DIR = join(CHAT_HOME, "worker-status");
 
@@ -436,6 +443,8 @@ export default function (pi: ExtensionAPI) {
 
 	let runtime: ConversationRuntime | undefined;
 	let liveConnection: LiveConnection | undefined;
+	let accountFeed: AccountFeed | undefined;
+	let logTailInterval: ReturnType<typeof setInterval> | undefined;
 	let sandbox: ConversationSandbox | undefined;
 	let ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
 	let chatTurnInFlight = false;
@@ -568,6 +577,16 @@ export default function (pi: ExtensionAPI) {
 		return formatted ? `\n\nAvailable skills:\n${formatted}` : "";
 	}
 
+	function buildMountsSuffix(): string {
+		const mounts = runtime?.conversation.channel.gondolin?.mounts ?? [];
+		if (mounts.length === 0) return "";
+		const lines = mounts.map((mount) => {
+			const guest = mount.guestPath?.trim() || `/workspace/${basename(mount.hostPath)}`;
+			return `- ${guest} → ${mount.hostPath}${mount.readOnly === false ? " (read-write)" : " (read-only)"}`;
+		});
+		return `\n\nMounted host folders (host paths are reachable through these guest paths only):\n${lines.join("\n")}`;
+	}
+
 	async function buildSystemMdSuffix(): Promise<string> {
 		if (!runtime) return "";
 		const systemMd = await safeReadMountedText(
@@ -651,6 +670,37 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	}
 
+	// Chat tools appear only while a conversation is connected; everything else that is
+	// active (file tools, bg, subagent, ...) stays untouched. With codemode.mode = "only"
+	// the model reaches direct tools through codemode scripts instead of declarations.
+	function setChatToolsActive(chatConnected: boolean): void {
+		const withoutChat = pi.getActiveTools().filter((name) => !CHAT_TOOLS.includes(name));
+		pi.setActiveTools(chatConnected ? [...withoutChat, ...CHAT_TOOLS] : withoutChat);
+	}
+
+	async function registerTopicChannel(chatId: string, threadId: number, name: string): Promise<void> {
+		if (!runtime) return;
+		const accountId = runtime.conversation.accountId;
+		const config = await loadChatConfig();
+		const account = config.accounts[accountId];
+		if (!account) return;
+		if (Object.values(account.channels).some((channel) => channel.id === chatId && channel.threadId === threadId))
+			return;
+		const chatName = Object.values(account.channels).find((channel) => channel.id === chatId)?.name ?? chatId;
+		const channelKey = ensureUniqueKey(
+			account.channels,
+			makeChannelKey(`${chatName}-${name}`, `${chatId}-topic-${threadId}`),
+		);
+		account.channels[channelKey] = {
+			id: chatId,
+			name: `${chatName} / ${name}`,
+			threadId,
+			access: { trigger: "mention", ignoreBots: true },
+		};
+		await saveChatConfig(config);
+		console.log(`[pi-chat] topic registered: ${accountId}/${channelKey} (thread ${threadId})`);
+	}
+
 	async function connectConversation(
 		ctx: ExtensionContext,
 		conversationId: string,
@@ -675,101 +725,118 @@ export default function (pi: ExtensionAPI) {
 			runtime = await ConversationRuntime.connect(conversation, ownerId);
 			sandbox = new ConversationSandbox(conversation);
 			await sandbox.start();
-			liveConnection = await connectLive(
-				conversation,
-				{
-					onMessage: async (input, checkpoint) => {
-						if (!runtime) return;
-						const secretResult = tryDecryptSecret(input.text);
-						if (secretResult) {
-							if (sandbox) {
-								const vm = await sandbox.start();
-								await vm.fs.mkdir("/workspace/.secrets", { recursive: true });
-								await vm.fs.writeFile(`/workspace/.secrets/${secretResult.name}`, secretResult.decrypted);
-							}
-							await liveConnection?.sendImmediate(
-								`\u2705 Secret received and stored as /workspace/.secrets/${secretResult.name}`,
-							);
-							if (checkpoint) await runtime.noteCheckpoint(checkpoint);
-							const notification: typeof input = {
-								...input,
-								text: `[secret stored: ${secretResult.name} at /workspace/.secrets/${secretResult.name}]`,
-								mentionedBot: true,
-							};
-							await runtime.ingestInbound(notification, checkpoint);
-							await tryDispatch(ctx);
+			liveConnection = await connectLive(conversation);
+			const handleOwnInbound = async (input: InboundMessageInput): Promise<void> => {
+				if (!runtime) return;
+				const secretResult = tryDecryptSecret(input.text);
+				if (secretResult) {
+					if (sandbox) {
+						const vm = await sandbox.start();
+						await vm.fs.mkdir("/workspace/.secrets", { recursive: true });
+						await vm.fs.writeFile(`/workspace/.secrets/${secretResult.name}`, secretResult.decrypted);
+					}
+					await liveConnection?.sendImmediate(
+						`\u2705 Secret received and stored as /workspace/.secrets/${secretResult.name}`,
+					);
+					const notification: typeof input = {
+						...input,
+						text: `[secret stored: ${secretResult.name} at /workspace/.secrets/${secretResult.name}]`,
+						mentionedBot: true,
+					};
+					await runtime.ingestInbound(notification);
+					await tryDispatch(ctx);
+					return;
+				}
+				const control = runtime.isArmed() ? runtime.parseControlCommand(input) : undefined;
+				if (control === "stop") {
+					if (chatTurnInFlight || !ctx.isIdle()) {
+						ctx.abort();
+						await liveConnection?.sendImmediate("Aborted current turn.");
+					} else {
+						await liveConnection?.sendImmediate("No active turn.");
+					}
+					return;
+				}
+				if (control === "compact") {
+					const runCompact = async () => {
+						ctx.compact({
+							onComplete: () => void liveConnection?.sendImmediate("Compaction completed."),
+							onError: (error) => void liveConnection?.sendImmediate(`Compaction failed: ${error.message}`),
+						});
+						await liveConnection?.sendImmediate("Compaction started.");
+					};
+					if (chatTurnInFlight || !ctx.isIdle()) {
+						pendingControlAction = runCompact;
+						ctx.abort();
+						await liveConnection?.sendImmediate("Aborting current turn, then compacting.");
+						return;
+					}
+					await runCompact();
+					return;
+				}
+				if (control === "status") {
+					await liveConnection?.sendImmediate(buildRemoteStatus(ctx));
+					return;
+				}
+				if (control === "new") {
+					const queueNewSession = async () => {
+						pi.sendUserMessage("/chat-new", { deliverAs: "followUp" });
+						await liveConnection?.sendImmediate("Starting a new pi session.");
+					};
+					if (chatTurnInFlight || !ctx.isIdle()) {
+						pendingControlAction = queueNewSession;
+						ctx.abort();
+						await liveConnection?.sendImmediate("Aborting current turn, then starting a new pi session.");
+						return;
+					}
+					await queueNewSession();
+					return;
+				}
+				await runtime.ingestInbound(input);
+				await tryDispatch(ctx);
+			};
+			accountFeed = startAccountFeed({
+				accountId: conversation.accountId,
+				botToken: (conversation.account as TelegramAccountConfig).botToken,
+				ownChannelKey: conversation.channelKey,
+				ownerId,
+				callbacks: {
+					onInbound: async (target, input, own) => {
+						if (own) {
+							await handleOwnInbound(input);
 							return;
 						}
-						const control = runtime.isArmed() ? runtime.parseControlCommand(input) : undefined;
-						if (control === "stop") {
-							if (chatTurnInFlight || !ctx.isIdle()) {
-								ctx.abort();
-								await liveConnection?.sendImmediate("Aborted current turn.");
-							} else {
-								await liveConnection?.sendImmediate("No active turn.");
-							}
-							return;
-						}
-						if (control === "compact") {
-							const runCompact = async () => {
-								ctx.compact({
-									onComplete: () => void liveConnection?.sendImmediate("Compaction completed."),
-									onError: (error) => void liveConnection?.sendImmediate(`Compaction failed: ${error.message}`),
-								});
-								await liveConnection?.sendImmediate("Compaction started.");
-							};
-							if (chatTurnInFlight || !ctx.isIdle()) {
-								pendingControlAction = runCompact;
-								ctx.abort();
-								await liveConnection?.sendImmediate("Aborting current turn, then compacting.");
-								return;
-							}
-							await runCompact();
-							return;
-						}
-						if (control === "status") {
-							await liveConnection?.sendImmediate(buildRemoteStatus(ctx));
-							return;
-						}
-						if (control === "new") {
-							const queueNewSession = async () => {
-								pi.sendUserMessage("/chat-new", { deliverAs: "followUp" });
-								await liveConnection?.sendImmediate("Starting a new pi session.");
-							};
-							if (chatTurnInFlight || !ctx.isIdle()) {
-								pendingControlAction = queueNewSession;
-								ctx.abort();
-								await liveConnection?.sendImmediate("Aborting current turn, then starting a new pi session.");
-								return;
-							}
-							await queueNewSession();
-							return;
-						}
-						await runtime.ingestInbound(input, checkpoint);
-						await tryDispatch(ctx);
+						await appendRemoteInbound(target, ownerId, input);
 					},
-					onCaughtUp: async () => {
-						runtime?.armAfterCurrentTail();
+					onTopicCreated: async (chatId, threadId, name) => {
+						await registerTopicChannel(chatId, threadId, name);
 					},
 					onError: async (error) => {
 						if (runtime) await runtime.appendError(error.message);
 						updateStatus(ctx, error.message);
 					},
-					onDisconnect: async () => {
-						if (!runtime) return;
-						const cid = runtime.conversation.conversationId;
-						updateStatus(ctx, "disconnected, reconnecting...");
-						if (liveConnection) {
-							await liveConnection.disconnect().catch(() => undefined);
-							liveConnection = undefined;
-						}
-						await connectConversation(ctx, cid, false);
-					},
 				},
-				runtime.getLastCheckpoint(),
-			);
+			});
+			runtime.armAfterCurrentTail();
+			logTailInterval = setInterval(() => {
+				void (async () => {
+					if (!runtime) return;
+					const queued = await runtime.absorbExternalRecords();
+					if (queued) {
+						updateStatus(ctx);
+						await tryDispatch(ctx);
+					}
+				})().catch(() => undefined);
+			}, 2000);
 		});
 		if (result.error) {
+			if (logTailInterval) {
+				clearInterval(logTailInterval);
+				logTailInterval = undefined;
+			}
+			const failedFeed = accountFeed;
+			accountFeed = undefined;
+			if (failedFeed) await failedFeed.stop().catch(() => undefined);
 			if (liveConnection) {
 				await liveConnection.disconnect().catch(() => undefined);
 				liveConnection = undefined;
@@ -786,6 +853,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		persistChatState(conversation.conversationId);
 		startWorkerStatusLoop(ctx);
+		setChatToolsActive(true);
 		if (interactive) ctx.ui.notify(`Connected ${conversation.conversationName}`, "info");
 		await showChatContextMessage();
 		updateStatus(ctx);
@@ -1101,6 +1169,14 @@ export default function (pi: ExtensionAPI) {
 	async function disconnectRuntime(ctx: ExtensionContext, clearPersistedState = true): Promise<void> {
 		stopTypingLoop();
 		stopWorkerStatusLoop();
+		if (logTailInterval) {
+			clearInterval(logTailInterval);
+			logTailInterval = undefined;
+		}
+		const feed = accountFeed;
+		accountFeed = undefined;
+		if (feed) await feed.stop().catch(() => undefined);
+		setChatToolsActive(false);
 		if (runtime) await writeWorkerStatus(ctx, "disconnected").catch(() => undefined);
 		const connection = liveConnection;
 		liveConnection = undefined;
@@ -1122,18 +1198,35 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_call", async (event) => {
 		if (!chatTurnInFlight) return;
-		if (
-			["read", "write", "edit", "bash", "chat_attach", "chat_history", "chat_request_secret"].includes(event.toolName)
-		)
-			return;
-		return {
-			block: true,
-			reason: "pi-chat remote turns only allow read, write, edit, bash, chat_history, and chat_attach",
-		};
+		// "codemode" is how the model reaches the file tools (see codemode.mode = "only").
+		const remoteAllowed = [
+			"codemode",
+			"read",
+			"write",
+			"edit",
+			"bash",
+			"chat_attach",
+			"chat_history",
+			"chat_request_secret",
+		];
+		if (!remoteAllowed.includes(event.toolName)) {
+			return {
+				block: true,
+				reason: "pi-chat remote turns only allow read, write, edit, bash, chat_history, and chat_attach",
+			};
+		}
+		const configuredTools = runtime?.conversation.channel.tools;
+		if (configuredTools?.length && !configuredTools.includes(event.toolName)) {
+			return {
+				block: true,
+				reason: `Tool "${event.toolName}" is not allowed in this channel (allowed: ${configuredTools.join(", ")})`,
+			};
+		}
+		return;
 	});
 
 	pi.registerCommand("chat-config", {
-		description: "Configure pi-chat Discord and Telegram accounts and channels",
+		description: "Configure pi-chat Telegram accounts and chats",
 		handler: async (_args, ctx) => {
 			await loadConfigOnce();
 			const conversationId = runtime?.conversation.conversationId;
@@ -1304,6 +1397,8 @@ export default function (pi: ExtensionAPI) {
 		const writeDefinition = createWriteToolDefinition(ctx.cwd);
 		const editDefinition = createEditToolDefinition(ctx.cwd);
 		const bashDefinition = createBashToolDefinition(ctx.cwd);
+		// File tools run inside the Gondolin VM. With codemode.mode = "only" (pi setting)
+		// the model reaches them only through codemode scripts instead of direct calls.
 		pi.registerTool({
 			...readDefinition,
 			async execute(id, params, signal, onUpdate, toolCtx) {
@@ -1332,16 +1427,8 @@ export default function (pi: ExtensionAPI) {
 				return tool.execute(id, params, signal, onUpdate);
 			},
 		});
-		pi.setActiveTools([
-			"read",
-			"write",
-			"edit",
-			"bash",
-			"chat_history",
-			"chat_attach",
-			"chat_request_secret",
-			"chat_workers",
-		]);
+		// Chat tools appear only while a conversation is connected.
+		setChatToolsActive(false);
 		updateStatus(ctx);
 		const flaggedConversationId = pi.getFlag(CHAT_CONVERSATION_FLAG);
 		const persistedConversationId = getPersistedConversationId(ctx);
@@ -1389,7 +1476,8 @@ export default function (pi: ExtensionAPI) {
 				buildChatSystemPromptSuffix(service, mode, channelName) +
 				memorySuffix +
 				skillsSuffix +
-				systemMdSuffix,
+				systemMdSuffix +
+				buildMountsSuffix(),
 		};
 	});
 

@@ -49,12 +49,10 @@ export const telegramDiscoveryProvider: DiscoveryProvider = {
 			identity: validation.identity,
 			channels: [],
 			users: [],
-			roles: [],
 			warnings: validation.warnings,
 			capabilities: {
 				canListChannels: false,
 				canListUsers: false,
-				canListRoles: false,
 			},
 		};
 	},

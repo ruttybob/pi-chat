@@ -1,71 +1,76 @@
 # pi-chat
 
-Pi extension bridging Discord and Telegram to a sandboxed pi session via Gondolin micro-VMs.
+Pi extension bridging Telegram to a sandboxed pi session via Gondolin micro-VMs.
 
 ## Architecture
 
 ```
-Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ pi agent
-                                        ↕
-                                   Gondolin VM (Alpine + bash)
-                                   /workspace  /shared
+Telegram ←→ Account feed ←→ Runtime (log, jobs, slices) ←→ pi agent
+                                 ↕
+                         Gondolin VM (Alpine + bash)
+                         /workspace  /shared
 ```
 
-- **One VM per connection.** Started on `/chat-connect`, closed on `/chat-disconnect`. `/chat-spawn-all` launches one detached tmux/pi worker per configured channel using the `--chat-conversation <account/channel>` extension flag. `/chat-workers`, `/chat-open-all`, and `/chat-kill-all` manage those workers through tmux. Workers write status JSON to `~/.pi/agent/chat/worker-status/`; the `chat_workers` tool reads it.
-- **One JSONL log per channel.** Append-only event stream: inbound, outbound, job lifecycle.
-- **Trigger-based dispatch.** Mentions in channels, every message in DMs. Triggers queue jobs; jobs produce slices of inbound records for the agent.
-- **Tools run inside the VM.** `read`, `write`, `edit`, `bash` are routed through Gondolin. `chat_history` and `chat_attach` run on the host.
+- **One conversation = one VM.** A conversation is a DM, a group, or a forum **topic** (supergroup with Topics enabled; General = thread 1). One topic = one channel = one workspace/memory, like Discord channels.
+- **One `getUpdates` poller per bot token** (Telegram allows a single consumer): `src/live/feed.ts` takes an account-level lock (`feed.lock`), persists its cursor in `feed.json`, and fans updates out to conversation logs by (chat id, thread_id). Followers tail their own logs (`runtime.absorbExternalRecords`) and take over leadership if the leader dies.
+- **Cross-process log appends go through `.lock.append`** (`withAppendLock` in `src/log.ts`): recordIds are allocated from the log tail under the lock, so the feed leader and the conversation worker never collide.
+- **Tools run inside the VM.** `read`/`write`/`edit`/`bash` are VM delegates registered with `exposure: "codemode"` (pi 1.4.0 API; dev types are older, hence casts); `chat_history`, `chat_attach`, `chat_workers`, `chat_request_secret` run on the host. Per-channel `tools` whitelist is enforced in the `tool_call` hook during remote turns.
+- **`/chat-spawn-all`** launches one detached tmux/pi worker per configured channel using the `--chat-conversation <account/channel>` extension flag. `/chat-workers`, `/chat-open-all`, `/chat-kill-all` manage workers; status snapshots every 15s to `~/.pi/agent/chat/worker-status/`.
 
 ## Entry point
 
-`index.ts` — Extension factory. Registers tools, commands, event handlers, connection lifecycle, and tmux spawning.
+`index.ts` — Extension factory. Registers tools, commands, event handlers, connection lifecycle, tmux spawning.
 
 ## Key files
 
 ### Core types
-- `src/core/config-types.ts` — Config, account, channel, secret, and resolved conversation types.
+
+- `src/core/config-types.ts` — Config, account, channel (`threadId`, `tools`), secret, mount, resolved conversation types.
 - `src/core/runtime-types.ts` — Log record types, job types, dispatch types.
-- `src/core/discovery-types.ts` — Discovery snapshot types (channels, users, roles).
-- `src/core/keys.ts` — Channel key derivation.
+- `src/core/keys.ts` — Channel key derivation, `ensureUniqueKey`.
 
 ### Config & storage
-- `src/config.ts` — Load/save config, resolve conversations, storage paths. Everything under `~/.pi/agent/chat/`.
-- `src/discovery-store.ts` — Read/write discovery snapshots (cached channel/user/role lists).
-- `src/log.ts` — JSONL log read/write, locking, attachment materialization, directory setup.
+
+- `src/config.ts` — Load/save config (drops non-Telegram accounts with a warning), resolve conversations, storage paths. Everything under `~/.pi/agent/chat/`.
+- `src/discovery-store.ts` — Read/write discovery snapshots (cached bot identity).
+- `src/log.ts` — JSONL log read/write, conversation locks, append locks, attachment materialization, directory setup.
 
 ### Runtime
-- `src/runtime.ts` — `ConversationRuntime`: log state machine, job queue, slice construction, prompt building, checkpoint management. Owns trigger logic, access policy, control command parsing.
+
+- `src/runtime.ts` — `ConversationRuntime`: log state machine, triggers (`mention`/`message`), job queue, slices, prompt building, checkpoint-free catch-up arming, `absorbExternalRecords`.
+
+### Telegram live layer
+
+- `src/live/telegram.ts` — Outbound transport (every send carries `message_thread_id` when the channel is a topic) + Bot API helpers (`callTelegramApi`, `messageToInput`, `mergeMediaGroup`).
+- `src/live/feed.ts` — Account-level `getUpdates` poller: leadership, cursor, (chat_id, thread_id) matching, media-group debounce, `forum_topic_created` auto-registration callback.
+- `src/live/types.ts` — `LiveConnection`.
+- `src/live/common.ts` — Attachment download/storage, MIME detection, mention detection.
 
 ### Gondolin sandbox
-- `src/gondolin.ts` — `ConversationSandbox`: VM lifecycle, secret environment setup, tool operation factories (read/write/edit/ls/find/grep/bash), guest/host path translation.
+
+- `src/gondolin.ts` — `ConversationSandbox`: VM lifecycle, `resolveSecretEnvironment` (auto-provisions `bot_token` secret for `api.telegram.org` with a URL-path rewrite hook — Telegram keeps the token in the path, Gondolin only rewrites headers/query), extra mounts (`gondolin.mounts`, `ReadonlyProvider` for read-only), tool op factories, guest/host path translation with longest-prefix mount table.
 
 ### Secrets
-- `src/secrets.ts` — Encrypted secret exchange: RSA keypair generation, widget URL construction, hybrid RSA-OAEP + AES-256-GCM decryption.
 
-### Live adapters
-- `src/live/types.ts` — `LiveConnection` and `LiveConnectionHandlers` interfaces.
-- `src/live/index.ts` — Adapter router (Discord vs Telegram).
-- `src/live/discord.ts` — Discord adapter: discord.js gateway, catch-up pagination, REST message sending with chunking and formatting, reply-to, auto-reconnect on disconnect.
-- `src/live/telegram.ts` — Telegram adapter: long-polling, media group debounce, initial catch-up, chunked sending with Markdown formatting.
-- `src/live/common.ts` — Shared: attachment download/storage, MIME detection, bot mention detection.
+- `src/secrets.ts` — RSA-OAEP + AES-256-GCM secret exchange via `pi.dev/secret` widget; decrypted files land in `/workspace/.secrets/`.
 
 ### Rendering
-- `src/render/format.ts` — Service-specific markdown normalization and message length limits.
-- `src/render/chunking.ts` — Text chunking for service message limits.
-- `src/render/streaming.ts` — `StreamingPreview`: chunked preview transport (currently unused, kept for potential future streaming).
-- `src/render/streaming-markdown.ts` — Streaming markdown renderer (currently unused).
 
-### Services (setup/discovery)
+- `src/render/format.ts` — Telegram markdown normalization, 4096 limit.
+- `src/render/chunking.ts` — Chunking for service message limits.
+- `src/render/streaming.ts` — `StreamingPreview` (edit-in-place previews).
+
+### Services (setup)
+
 - `src/services/index.ts` — Account snapshot refresh, identity update.
-- `src/services/discord.ts` — Discord bot validation, server listing, channel/role/user discovery.
-- `src/services/telegram.ts` — Telegram bot validation, identity fetch.
+- `src/services/telegram.ts` — Telegram bot validation.
 - `src/services/types.ts` — Shared service types.
 
 ### TUI
-- `src/tui/chat-config.ts` — `/chat-config` UI: account/channel management, access policy, secrets config.
-- `src/tui/dialogs.ts` — Shared dialog helpers: select, notice, loader, toggle.
-- `src/tui/discord-setup.ts` — Guided Discord account setup (token, server selection, invite flow).
-- `src/tui/telegram-setup.ts` — Guided Telegram account setup (token, DM/group observation).
+
+- `src/tui/chat-config.ts` — `/chat-config` UI: accounts, channels/topics, access policy, secrets.
+- `src/tui/dialogs.ts` — Shared dialog helpers.
+- `src/tui/telegram-setup.ts` — Guided setup: DM, group, topic (observe / bot-created via `createForumTopic`).
 
 ## Storage layout
 
@@ -73,21 +78,21 @@ Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ p
 ~/.pi/agent/chat/
 ├── config.json
 ├── cache/
-└── accounts/<account>/
-    ├── shared/                    → /shared in VM
-    │   ├── memory.md
-    │   └── skills/
-    └── channels/<channel>/
-        ├── channel.jsonl
-        ├── .lock
-        ├── workspace/             → /workspace in VM
-        │   ├── memory.md
-        │   ├── skills/
-        │   ├── incoming/
-        │   ├── .secrets/
-        │   └── SYSTEM.md
-        └── gondolin/
-            └── session.json
+├── accounts/<account>/
+│   ├── feed.lock / feed.json      → getUpdates leadership + cursor
+│   ├── shared/                    → /shared in VM
+│   │   ├── memory.md
+│   │   └── skills/
+│   └── channels/<channel>/
+│       ├── channel.jsonl
+│       ├── .lock / .lock.append
+│       ├── workspace/             → /workspace in VM (per topic)
+│       │   ├── memory.md
+│       │   ├── skills/
+│       │   ├── incoming/
+│       │   ├── .secrets/
+│       │   └── SYSTEM.md
+│       └── gondolin/session.json
 ```
 
 ## Log record types
@@ -96,21 +101,13 @@ Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ p
 
 ## Job/slice semantics
 
-- `job_queued` records a trigger. `sliceStartRecordId` is derived at dispatch time from the last `job_completed.triggerRecordId`.
+- `job_queued` records a trigger; the slice spans the last completed boundary up to the trigger.
 - Failed jobs do not advance the consumption boundary.
-- The prompt slice includes all inbound records between the last completed boundary and the trigger.
-- On reconnect, catch-up messages are logged but do not trigger until a new trigger arrives after arming.
+- On connect the log is armed after its current tail: backlog is logged, not triggered.
 
 ## Remote control commands
 
-Parsed by `ConversationRuntime.parseControlCommand()`: `stop`, `new`, `compact`, `status`. Handled before normal ingest in the `onMessage` path.
-
-## Secret exchange flow
-
-1. Agent calls `chat_request_secret` tool → RSA keypair generated, widget URL sent to chat.
-2. User opens `pi.dev/secret#<base64>`, pastes secret, gets encrypted blob.
-3. User pastes `!secret:<id>:<payload>` back into chat.
-4. pi-chat intercepts (before trigger check), decrypts, writes to `/workspace/.secrets/<name>`, notifies agent.
+Parsed by `ConversationRuntime.parseControlCommand()`: `stop`, `new`, `compact`, `status`.
 
 ## Conventions
 
