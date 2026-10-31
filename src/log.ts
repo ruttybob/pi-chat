@@ -262,6 +262,8 @@ export async function withAppendLock<T>(
 	owner: string,
 	fn: () => Promise<T>,
 ): Promise<T> {
+	// The account-level feed leader may fan out an inbound message to a channel whose worker/storage was never initialized (e.g. auto-registered forum topic).
+	await ensureConversationDirs(conversation);
 	const path = `${conversation.lockPath}.append`;
 	for (let attempt = 0; ; attempt++) {
 		if (await acquireFileLock(path, owner)) {
