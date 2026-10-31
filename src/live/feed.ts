@@ -26,7 +26,7 @@ export interface AccountFeedCallbacks {
 	// DM topics send no forum_topic_created service message, so the feed reports them
 	// from the first message instead (only for chats that already have a channel).
 	onTopicObserved(chatId: string, threadId: number): Promise<void>;
-	onError(error: Error): Promise<void>;
+	onError(error: Error, context?: { chatId?: string; channelKey?: string }): Promise<void>;
 }
 
 interface FeedState {
@@ -127,13 +127,22 @@ export function startAccountFeed(options: {
 			}
 		}
 		if (!entry) return;
-		const conversation = resolveConversation(config, `${accountId}/${entry[0]}`);
-		if (!conversation) return;
-		const account = config.accounts[accountId];
-		if (!account || account.service !== "telegram") return;
-		const input = await messageToInput(conversation, account as TelegramAccountConfig, message);
-		if (!input) return;
-		await callbacks.onInbound(conversation, input, entry[0] === ownChannelKey);
+		try {
+			const conversation = resolveConversation(config, `${accountId}/${entry[0]}`);
+			if (!conversation) return;
+			const account = config.accounts[accountId];
+			if (!account || account.service !== "telegram") return;
+			const input = await messageToInput(conversation, account as TelegramAccountConfig, message);
+			if (!input) return;
+			await callbacks.onInbound(conversation, input, entry[0] === ownChannelKey);
+		} catch (error) {
+			// Fan-out failure for this channel only: report its identity so the error lands
+			// in the right log, and let the poller keep dispatching to other channels.
+			await callbacks.onError(error instanceof Error ? error : new Error(String(error)), {
+				chatId,
+				channelKey: entry[0],
+			});
+		}
 	};
 
 	const flushMediaGroup = async (key: string): Promise<void> => {
@@ -162,7 +171,9 @@ export function startAccountFeed(options: {
 			if (entry.timer) clearTimeout(entry.timer);
 			entry.timer = setTimeout(() => {
 				void flushMediaGroup(key).catch(async (error) => {
-					await callbacks.onError(error instanceof Error ? error : new Error(String(error)));
+					await callbacks.onError(error instanceof Error ? error : new Error(String(error)), {
+						chatId: key.split(":")[0],
+					});
 				});
 			}, 1200);
 			mediaGroups.set(key, entry);

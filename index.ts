@@ -36,7 +36,7 @@ import { type AccountFeed, startAccountFeed } from "./src/live/feed.js";
 import { connectLive } from "./src/live/index.js";
 import { callTelegramApi } from "./src/live/telegram.js";
 import type { LiveConnection } from "./src/live/types.js";
-import { appendRemoteInbound } from "./src/log.js";
+import { appendRemoteError, appendRemoteInbound } from "./src/log.js";
 import { ConversationRuntime } from "./src/runtime.js";
 import { createSecretRequest, tryDecryptSecret } from "./src/secrets.js";
 import { runChatConfigUI } from "./src/tui/chat-config.js";
@@ -870,8 +870,25 @@ export default function (pi: ExtensionAPI) {
 							text: `Registered this topic as channel ${runtime.conversation.accountId}/${channelKey}. Run /chat-spawn-all on the host to start its worker.`,
 						}).catch(() => undefined);
 					},
-					onError: async (error) => {
-						if (runtime) await runtime.appendError(error.message);
+					onError: async (error, context) => {
+						const tag = context?.channelKey
+							? `[channel ${context.channelKey}] `
+							: context?.chatId
+								? `[chat ${context.chatId}] `
+								: "";
+						if (runtime && context?.channelKey) {
+							// Fan-out failure: record it in the affected channel's log, not ours.
+							const target = resolveConversation(
+								await loadChatConfig(),
+								`${runtime.conversation.accountId}/${context.channelKey}`,
+							);
+							if (target) {
+								await appendRemoteError(target, ownerId, error.message);
+								updateStatus(ctx, error.message);
+								return;
+							}
+						}
+						if (runtime) await runtime.appendError(`${tag}${error.message}`);
 						updateStatus(ctx, error.message);
 					},
 				},

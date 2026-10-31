@@ -308,3 +308,21 @@ export async function appendRemoteInbound(
 		return record;
 	});
 }
+
+// Feed fan-out error for this channel: same cross-process recordId allocation as
+// appendRemoteInbound, so the worker sees it even before its first connect.
+export async function appendRemoteError(
+	conversation: ResolvedConversation,
+	owner: string,
+	message: string,
+): Promise<void> {
+	await withAppendLock(conversation, owner, async () => {
+		const tail = await readLogTailRecords(conversation.logPath);
+		const maxId = tail.reduce((max, record) => Math.max(max, record.recordId), 0);
+		await appendConversationRecord(conversation, {
+			type: "error",
+			...buildBaseRecordFields(conversation, maxId + 1),
+			message,
+		});
+	});
+}
