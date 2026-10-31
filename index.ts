@@ -461,18 +461,6 @@ export default function (pi: ExtensionAPI) {
 		pi.appendEntry<PersistedChatState>(SESSION_STATE_CUSTOM_TYPE, { conversationId });
 	}
 
-	function getPersistedConversationId(ctx: ExtensionContext): string | undefined {
-		const entries = ctx.sessionManager.getEntries();
-		for (let index = entries.length - 1; index >= 0; index--) {
-			const entry = entries[index] as unknown as Record<string, unknown>;
-			if (entry.type !== "custom" || entry.customType !== SESSION_STATE_CUSTOM_TYPE) continue;
-			const data = entry.data as PersistedChatState | undefined;
-			if (typeof data?.conversationId === "string" && data.conversationId.trim()) return data.conversationId;
-			return undefined;
-		}
-		return undefined;
-	}
-
 	function stableSecretsKey(secrets: Record<string, { value: string; hosts: string[] }>): string {
 		return JSON.stringify(
 			Object.entries(secrets)
@@ -1434,6 +1422,7 @@ export default function (pi: ExtensionAPI) {
 				spec = (await selectItem(ctx, "Connect pi-chat channel", items)) || "";
 				if (!spec) return;
 			}
+			registerVmFileTools(ctx);
 			await connectConversation(ctx, spec, true);
 		},
 	});
@@ -1466,9 +1455,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		await loadConfigOnce();
-		ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
+	function registerVmFileTools(ctx: ExtensionContext): void {
 		const readDefinition = createReadToolDefinition(ctx.cwd);
 		const writeDefinition = createWriteToolDefinition(ctx.cwd);
 		const editDefinition = createEditToolDefinition(ctx.cwd);
@@ -1503,16 +1490,18 @@ export default function (pi: ExtensionAPI) {
 				return tool.execute(id, params, signal, onUpdate);
 			},
 		});
+	}
+
+	pi.on("session_start", async (_event, ctx) => {
+		await loadConfigOnce();
+		ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
 		// Chat tools appear only while a conversation is connected.
 		setChatToolsActive(false);
 		updateStatus(ctx);
 		const flaggedConversationId = pi.getFlag(CHAT_CONVERSATION_FLAG);
-		const persistedConversationId = getPersistedConversationId(ctx);
-		const conversationId =
-			typeof flaggedConversationId === "string" && flaggedConversationId.trim()
-				? flaggedConversationId.trim()
-				: persistedConversationId;
-		if (conversationId) await connectConversation(ctx, conversationId, false);
+		if (typeof flaggedConversationId !== "string" || !flaggedConversationId.trim()) return;
+		registerVmFileTools(ctx);
+		await connectConversation(ctx, flaggedConversationId.trim(), false);
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
