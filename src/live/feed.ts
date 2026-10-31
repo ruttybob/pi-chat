@@ -100,15 +100,18 @@ export function startAccountFeed(options: {
 		const rawThread =
 			message.is_topic_message || message.message_thread_id !== undefined ? message.message_thread_id : undefined;
 		const threadedDm = message.chat.type === "private" && (await hasTopicsEnabled());
-		const threadId = rawThread ?? (threadedDm || (await isForum(chatId)) ? 1 : undefined);
+		// is_forum is supergroup-only, so private chats skip the getChat call.
+		const forum = threadedDm || (message.chat.type !== "private" && (await isForum(chatId)));
+		const threadId = rawThread ?? (forum ? 1 : undefined);
 		const findEntry = (config: ChatConfig) => {
 			const account = config.accounts[accountId];
 			if (!account || account.service !== "telegram") return undefined;
 			const exact = Object.entries(account.channels).find(
 				([, channel]: [string, ConfiguredChannel]) => channel.id === chatId && channel.threadId === threadId,
 			);
-			// General (thread 1) of a threaded DM maps to the pre-threaded DM channel.
-			if (!exact && threadedDm && threadId === 1)
+			// General (thread 1) maps to the pre-topics channel of a threaded DM or a
+			// forum supergroup configured before Topics were enabled.
+			if (!exact && forum && threadId === 1)
 				return Object.entries(account.channels).find(
 					([, channel]: [string, ConfiguredChannel]) => channel.id === chatId && channel.threadId === undefined,
 				);
