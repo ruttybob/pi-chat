@@ -2,7 +2,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { getAccountStorageDir, loadChatConfig, resolveConversation } from "../config.js";
-import type { ConfiguredChannel, TelegramAccountConfig } from "../core/config-types.js";
+import type { ChatConfig, ConfiguredChannel, TelegramAccountConfig } from "../core/config-types.js";
 import type { InboundMessageInput } from "../core/runtime-types.js";
 import { acquireFileLock, releaseFileLock } from "../log.js";
 import {
@@ -23,12 +23,16 @@ export interface AccountFeedCallbacks {
 		own: boolean,
 	): Promise<void>;
 	onTopicCreated(chatId: string, threadId: number, name: string): Promise<void>;
+	// DM topics send no forum_topic_created service message, so the feed reports them
+	// from the first message instead (only for chats that already have a channel).
+	onTopicObserved(chatId: string, threadId: number): Promise<void>;
 	onError(error: Error): Promise<void>;
 }
 
 interface FeedState {
 	cursor?: number;
 	forumChats?: Record<string, boolean>;
+	botHasTopics?: boolean;
 }
 
 export interface AccountFeed {
@@ -77,20 +81,56 @@ export function startAccountFeed(options: {
 		return value;
 	};
 
+	// "Topics in private chats" is a bot-wide mode (Bot API 9.3); getMe is the only way
+	// to detect it — Chat.is_forum is supergroup-only.
+	const hasTopicsEnabled = async (): Promise<boolean> => {
+		if (state.botHasTopics !== undefined) return state.botHasTopics;
+		try {
+			const me = await callTelegramApi<{ has_topics_enabled?: boolean }>(botToken, "getMe", {});
+			state.botHasTopics = me.has_topics_enabled ?? false;
+		} catch {
+			state.botHasTopics = false;
+		}
+		await persistState();
+		return state.botHasTopics;
+	};
+
 	const dispatch = async (message: TelegramMessage): Promise<void> => {
-		const config = await loadChatConfig();
-		const account = config.accounts[accountId];
-		if (!account || account.service !== "telegram") return;
 		const chatId = String(message.chat.id);
 		const rawThread =
 			message.is_topic_message || message.message_thread_id !== undefined ? message.message_thread_id : undefined;
-		const threadId = rawThread ?? ((await isForum(chatId)) ? 1 : undefined);
-		const entry = Object.entries(account.channels).find(
-			([, channel]: [string, ConfiguredChannel]) => channel.id === chatId && channel.threadId === threadId,
-		);
+		const threadedDm = message.chat.type === "private" && (await hasTopicsEnabled());
+		const threadId = rawThread ?? (threadedDm || (await isForum(chatId)) ? 1 : undefined);
+		const findEntry = (config: ChatConfig) => {
+			const account = config.accounts[accountId];
+			if (!account || account.service !== "telegram") return undefined;
+			const exact = Object.entries(account.channels).find(
+				([, channel]: [string, ConfiguredChannel]) => channel.id === chatId && channel.threadId === threadId,
+			);
+			// General (thread 1) of a threaded DM maps to the pre-threaded DM channel.
+			if (!exact && threadedDm && threadId === 1)
+				return Object.entries(account.channels).find(
+					([, channel]: [string, ConfiguredChannel]) => channel.id === chatId && channel.threadId === undefined,
+				);
+			return exact;
+		};
+		let config = await loadChatConfig();
+		let entry = findEntry(config);
+		if (!entry && threadedDm && threadId !== undefined) {
+			// First message from an unknown topic lazily registers its channel — only inside
+			// an already-configured chat, so unknown DMs stay unregistered (trust boundary).
+			const account = config.accounts[accountId];
+			if (account?.service === "telegram" && Object.values(account.channels).some((channel) => channel.id === chatId)) {
+				await callbacks.onTopicObserved(chatId, threadId);
+				config = await loadChatConfig();
+				entry = findEntry(config);
+			}
+		}
 		if (!entry) return;
 		const conversation = resolveConversation(config, `${accountId}/${entry[0]}`);
 		if (!conversation) return;
+		const account = config.accounts[accountId];
+		if (!account || account.service !== "telegram") return;
 		const input = await messageToInput(conversation, account as TelegramAccountConfig, message);
 		if (!input) return;
 		await callbacks.onInbound(conversation, input, entry[0] === ownChannelKey);

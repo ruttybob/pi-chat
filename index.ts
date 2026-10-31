@@ -34,6 +34,7 @@ import type { InboundMessageInput } from "./src/core/runtime-types.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
 import { type AccountFeed, startAccountFeed } from "./src/live/feed.js";
 import { connectLive } from "./src/live/index.js";
+import { callTelegramApi } from "./src/live/telegram.js";
 import type { LiveConnection } from "./src/live/types.js";
 import { appendRemoteInbound } from "./src/log.js";
 import { ConversationRuntime } from "./src/runtime.js";
@@ -678,15 +679,16 @@ export default function (pi: ExtensionAPI) {
 		pi.setActiveTools(chatConnected ? [...withoutChat, ...CHAT_TOOLS] : withoutChat);
 	}
 
-	async function registerTopicChannel(chatId: string, threadId: number, name: string): Promise<void> {
-		if (!runtime) return;
+	async function registerTopicChannel(chatId: string, threadId: number, name: string): Promise<string | undefined> {
+		if (!runtime) return undefined;
 		const accountId = runtime.conversation.accountId;
 		const config = await loadChatConfig();
 		const account = config.accounts[accountId];
-		if (!account) return;
+		if (!account) return undefined;
 		if (Object.values(account.channels).some((channel) => channel.id === chatId && channel.threadId === threadId))
-			return;
-		const chatName = Object.values(account.channels).find((channel) => channel.id === chatId)?.name ?? chatId;
+			return undefined;
+		const parent = Object.values(account.channels).find((channel) => channel.id === chatId);
+		const chatName = parent?.name ?? chatId;
 		const channelKey = ensureUniqueKey(
 			account.channels,
 			makeChannelKey(`${chatName}-${name}`, `${chatId}-topic-${threadId}`),
@@ -695,10 +697,51 @@ export default function (pi: ExtensionAPI) {
 			id: chatId,
 			name: `${chatName} / ${name}`,
 			threadId,
-			access: { trigger: "mention", ignoreBots: true },
+			// Topics inherit the chat's access policy; a forum topic without one keeps the
+			// mention-only default.
+			access: parent?.access ?? { trigger: "mention", ignoreBots: true },
 		};
 		await saveChatConfig(config);
 		console.log(`[pi-chat] topic registered: ${accountId}/${channelKey} (thread ${threadId})`);
+		return channelKey;
+	}
+
+	// "/new <name>" in a threaded chat (DM topics or a forum supergroup): create the
+	// topic, register its channel, and spawn its worker so it answers right away.
+	async function createTopicFromCommand(ctx: ExtensionContext, name: string): Promise<void> {
+		if (!runtime || !liveConnection) return;
+		const conversation = runtime.conversation;
+		const botToken = (conversation.account as TelegramAccountConfig).botToken;
+		const chatId = conversation.channel.id;
+		try {
+			const topic = await callTelegramApi<{ message_thread_id: number; name?: string }>(botToken, "createForumTopic", {
+				chat_id: Number(chatId),
+				name: name.slice(0, 128),
+			});
+			const threadId = topic.message_thread_id;
+			const topicName = topic.name || name.slice(0, 128);
+			const channelKey = await registerTopicChannel(chatId, threadId, topicName);
+			if (channelKey) {
+				const next = resolveConversation(await loadChatConfig(), `${conversation.accountId}/${channelKey}`);
+				if (next) {
+					try {
+						console.log(`[pi-chat] ${spawnConversationTmux(ctx, next, false)}`);
+					} catch {
+						// Worker not spawned; /chat-spawn-all picks the channel up later.
+					}
+				}
+			}
+			await callTelegramApi(botToken, "sendMessage", {
+				chat_id: Number(chatId),
+				message_thread_id: threadId,
+				text: `Topic "${topicName}" created (thread ${threadId}).`,
+			});
+			await liveConnection.sendImmediate(`Topic "${topicName}" created → thread ${threadId}.`);
+		} catch (error) {
+			await liveConnection.sendImmediate(
+				`Topic creation failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 	}
 
 	async function connectConversation(
@@ -779,6 +822,11 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (control === "new") {
+					const topicName = runtime.parseTopicCommand(input);
+					if (topicName) {
+						await createTopicFromCommand(ctx, topicName);
+						return;
+					}
 					const queueNewSession = async () => {
 						pi.sendUserMessage("/chat-new", { deliverAs: "followUp" });
 						await liveConnection?.sendImmediate("Starting a new pi session.");
@@ -810,6 +858,17 @@ export default function (pi: ExtensionAPI) {
 					},
 					onTopicCreated: async (chatId, threadId, name) => {
 						await registerTopicChannel(chatId, threadId, name);
+					},
+					onTopicObserved: async (chatId, threadId) => {
+						const channelKey = await registerTopicChannel(chatId, threadId, `topic-${threadId}`);
+						if (!channelKey || !runtime) return;
+						// Tell the user the topic is now a channel; its worker still needs spawning.
+						const botToken = (runtime.conversation.account as TelegramAccountConfig).botToken;
+						await callTelegramApi(botToken, "sendMessage", {
+							chat_id: Number(chatId),
+							message_thread_id: threadId,
+							text: `Registered this topic as channel ${runtime.conversation.accountId}/${channelKey}. Run /chat-spawn-all on the host to start its worker.`,
+						}).catch(() => undefined);
 					},
 					onError: async (error) => {
 						if (runtime) await runtime.appendError(error.message);

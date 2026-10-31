@@ -146,7 +146,9 @@ export class ConversationRuntime {
 		return this.isAllowedInput(message);
 	}
 
-	parseControlCommand(input: InboundMessageInput): "stop" | "new" | "compact" | "status" | undefined {
+	// Normalized control-command text: access-checked, bot mentions stripped, whitespace
+	// collapsed. Case is preserved so arguments like topic names survive.
+	private commandText(input: InboundMessageInput): string | undefined {
 		const normalized = normalizeInboundMessage(input, this.conversation.botName);
 		if (!this.isAllowedInput(normalized)) return undefined;
 		const account = this.conversation.account;
@@ -157,12 +159,26 @@ export class ConversationRuntime {
 			Boolean,
 		);
 		for (const alias of aliases) text = text.replace(new RegExp(`@${escapeRegExp(alias || "")}\\b`, "ig"), " ");
-		const command = text.replace(/\s+/g, " ").trim().toLowerCase();
+		return text.replace(/\s+/g, " ").trim();
+	}
+
+	parseControlCommand(input: InboundMessageInput): "stop" | "new" | "compact" | "status" | undefined {
+		const command = (this.commandText(input) ?? "").toLowerCase();
 		if (command === "stop" || command === "/stop") return "stop";
-		if (command === "new" || command === "/new") return "new";
+		// "/new <name>" also routes here; handleOwnInbound splits it off via parseTopicCommand.
+		if (command === "new" || command === "/new" || /^\/new \S/.test(command)) return "new";
 		if (command === "compact" || command === "/compact") return "compact";
 		if (command === "status" || command === "/status") return "status";
 		return undefined;
+	}
+
+	/** "/new <name>" creates a topic in threaded chats; plain "/new" (new session) → undefined. */
+	parseTopicCommand(input: InboundMessageInput): string | undefined {
+		const name = (this.commandText(input) ?? "")
+			.match(/^\/new (.+)$/i)?.[1]
+			.trim()
+			.slice(0, 128);
+		return name || undefined;
 	}
 
 	matchesStopCommand(input: InboundMessageInput): boolean {
