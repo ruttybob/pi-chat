@@ -35,6 +35,7 @@ import {
 	CHAT_TOOLS,
 	conversationBoundSessionTools,
 	isMcpToolName,
+	REMOTE_TURN_TOOLS,
 	remoteMcpAllowedTools,
 } from "./src/core/tool-surface.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
@@ -1244,22 +1245,10 @@ export default function (pi: ExtensionAPI) {
 			};
 		}
 		if (!chatTurnInFlight) return;
-		// "codemode" is how the model reaches the file tools (see codemode.mode = "only").
-		const remoteAllowed = [
-			"codemode",
-			"read",
-			"write",
-			"edit",
-			"bash",
-			"chat_attach",
-			"chat_history",
-			"chat_request_secret",
-		];
-		if (!remoteAllowed.includes(event.toolName) && !allowedMcp.has(event.toolName)) {
+		if (!REMOTE_TURN_TOOLS.includes(event.toolName) && !allowedMcp.has(event.toolName)) {
 			return {
 				block: true,
-				reason:
-					"pi-chat remote turns only allow read, write, edit, bash, chat_history, chat_attach, and allowlisted MCP tools",
+				reason: `pi-chat remote turns only allow ${REMOTE_TURN_TOOLS.join(", ")}, and allowlisted MCP tools`,
 			};
 		}
 		const configuredTools = runtime?.conversation.channel.tools;

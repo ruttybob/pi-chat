@@ -6,6 +6,11 @@ export const CHAT_TOOLS = ["chat_history", "chat_attach", "chat_workers", "chat_
 // tool_call hook keeps a defense-in-depth whitelist for remote turns.
 export const CONVERSATION_BOUND_TOOLS = ["read", "write", "edit", "bash", ...CHAT_TOOLS, "codemode"];
 
+// Remote turns (job-queue dispatch) run without a human watching: same surface minus
+// chat_workers (a host worker overview makes no sense mid-turn). This is the single
+// source for the tool_call hook's remote whitelist.
+export const REMOTE_TURN_TOOLS = CONVERSATION_BOUND_TOOLS.filter((name) => name !== "chat_workers");
+
 // pi names MCP server tools `mcp__<server>__<tool>` (everything but [A-Za-z0-9_] becomes
 // `_`) and registers resource tools that reach MCP servers too (mirrors pi's isMcpToolName).
 const MCP_RESOURCE_TOOLS = new Set(["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]);

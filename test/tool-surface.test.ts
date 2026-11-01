@@ -6,6 +6,7 @@ import {
 	conversationBoundSessionTools,
 	isMcpToolName,
 	mcpToolName,
+	REMOTE_TURN_TOOLS,
 	remoteMcpAllowedTools,
 } from "../src/core/tool-surface.ts";
 
@@ -23,6 +24,19 @@ const FULL_SESSION = [
 	"mcp__zread__search",
 	...CHAT_TOOLS,
 ];
+
+describe("REMOTE_TURN_TOOLS", () => {
+	it("is the conversation-bound surface minus chat_workers, exactly what the hook allows", () => {
+		assert.deepEqual(
+			REMOTE_TURN_TOOLS,
+			CONVERSATION_BOUND_TOOLS.filter((name) => name !== "chat_workers"),
+		);
+		assert.deepEqual(
+			[...REMOTE_TURN_TOOLS].sort(),
+			["bash", "chat_attach", "chat_history", "chat_request_secret", "codemode", "edit", "read", "write"].sort(),
+		);
+	});
+});
 
 describe("conversationBoundSessionTools", () => {
 	it("keeps only VM delegates, chat tools and codemode, in canonical order", () => {
