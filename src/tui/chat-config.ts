@@ -253,6 +253,62 @@ async function configureConfiguredChannel(
 	}
 }
 
+function remoteMcpSummary(remoteMcp: Record<string, string[]> | undefined): string {
+	const servers = Object.keys(remoteMcp ?? {});
+	if (servers.length === 0) return "none — MCP unavailable in connected sessions";
+	const tools = Object.values(remoteMcp ?? {}).flat().length;
+	return `${servers.length} server${servers.length === 1 ? "" : "s"}, ${tools} tool${tools === 1 ? "" : "s"}`;
+}
+
+async function configureRemoteMcp(
+	ctx: ExtensionContext,
+	title: string,
+	current: Record<string, string[]> | undefined,
+	save: (next: Record<string, string[]> | undefined) => Promise<void>,
+): Promise<void> {
+	while (true) {
+		const choice = await selectItem(ctx, title, [
+			...Object.entries(current ?? {}).map(([server, tools]) => ({
+				value: server,
+				label: server,
+				description: tools.join(", "),
+			})),
+			{ value: "__add__", label: "Add server", description: "Server name as configured in the session's mcp.json" },
+			{ value: "__back__", label: "Back" },
+		]);
+		if (!choice || choice === "__back__") return;
+		let server = choice;
+		if (choice === "__add__") {
+			const name = (await ctx.ui.input("MCP server name", "e.g. brave-search"))?.trim();
+			if (!name) continue;
+			if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+				await showNotice(ctx, "Invalid server name", "Use letters, digits, dashes, underscores", "warning");
+				continue;
+			}
+			server = name;
+		}
+		const toolsInput = await ctx.ui.input(
+			`Tools of "${server}" (comma-separated, empty removes the server)`,
+			(current?.[server] ?? []).join(", "),
+		);
+		if (toolsInput === undefined) continue;
+		const tools = toolsInput
+			.split(",")
+			.map((tool) => tool.trim())
+			.filter(Boolean);
+		if (tools.some((tool) => tool.includes("*"))) {
+			await showNotice(ctx, "Wildcard not supported", "List explicit tool names only", "warning");
+			continue;
+		}
+		const next = { ...(current ?? {}) };
+		if (tools.length === 0) delete next[server];
+		else next[server] = tools;
+		const saved = Object.keys(next).length > 0 ? next : undefined;
+		await save(saved);
+		current = saved;
+	}
+}
+
 async function configureTelegramAccount(ctx: ExtensionContext, accountId: string): Promise<void> {
 	while (true) {
 		const config = await loadChatConfig();
@@ -267,6 +323,7 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 		}));
 		const choice = await selectItem(ctx, `${accountId} (@${account.botUsername ?? "bot"})`, [
 			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
+			{ value: "remote-mcp", label: "Remote MCP", description: remoteMcpSummary(account.remoteMcp) },
 			{ value: "add-dm", label: "Add DM", description: "Pair a DM by sending /start to the bot" },
 			{ value: "add-group", label: "Add group", description: "Observe activity after adding the bot to a group" },
 			{
@@ -291,6 +348,19 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 				config.accounts[accountId] = account;
 				await saveChatConfig(config);
 			});
+			continue;
+		}
+		if (choice === "remote-mcp") {
+			await configureRemoteMcp(
+				ctx,
+				`${accountId} remote MCP (server → allowed tools)`,
+				account.remoteMcp,
+				async (next) => {
+					account.remoteMcp = next;
+					config.accounts[accountId] = account;
+					await saveChatConfig(config);
+				},
+			);
 			continue;
 		}
 		if (choice === "add-dm") {
