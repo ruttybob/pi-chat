@@ -1,7 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { existsSync } from "node:fs";
+import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { ensureGuestAssets, hasGuestAssets } from "@earendil-works/gondolin";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
@@ -27,7 +28,7 @@ import {
 	saveChatConfig,
 } from "./src/config.js";
 
-import type { ResolvedConversation, TelegramAccountConfig } from "./src/core/config-types.js";
+import type { GondolinMountConfig, ResolvedConversation, TelegramAccountConfig } from "./src/core/config-types.js";
 import { ensureUniqueKey, makeChannelKey } from "./src/core/keys.js";
 import type { InboundMessageInput } from "./src/core/runtime-types.js";
 import {
@@ -42,6 +43,14 @@ import { connectLive } from "./src/live/index.js";
 import { callTelegramApi } from "./src/live/telegram.js";
 import type { LiveConnection } from "./src/live/types.js";
 import { appendRemoteError, appendRemoteInbound } from "./src/log.js";
+import {
+	deriveWorktreeSlug,
+	formatMountsReminder,
+	mountsSignature,
+	PROJECT_MOUNT_GUEST_PATH,
+	removeProjectMount,
+	upsertProjectMount,
+} from "./src/project-mount.js";
 import { ConversationRuntime } from "./src/runtime.js";
 import { createSecretRequest, tryDecryptSecret } from "./src/secrets.js";
 import { type ChatPromptSkill, loadSafeChatSkills, safeReadMountedText } from "./src/skills.js";
@@ -104,6 +113,7 @@ type PersistedChatState = {
 };
 
 const SESSION_STATE_CUSTOM_TYPE = "pi-chat-state";
+const MOUNTS_REMINDER_CUSTOM_TYPE = "chat-mounts";
 const CHAT_CONVERSATION_FLAG = "chat-conversation";
 const WORKER_TMUX_PREFIX = "pi-chat-worker-";
 const DASHBOARD_TMUX_SESSION = "pi-chat-dashboard";
@@ -372,6 +382,7 @@ export default function (pi: ExtensionAPI) {
 	let pendingChatDispatch = false;
 	let pendingControlAction: (() => Promise<void>) | undefined;
 	let activeTriggerMessageId: string | undefined;
+	let lastMountsReminderSignature: string | undefined;
 
 	function persistChatState(conversationId?: string): void {
 		pi.appendEntry<PersistedChatState>(SESSION_STATE_CUSTOM_TYPE, { conversationId });
@@ -479,14 +490,31 @@ export default function (pi: ExtensionAPI) {
 		return formatted ? `\n\nAvailable skills:\n${formatted}` : "";
 	}
 
-	function buildMountsSuffix(): string {
+	// ADR 0002: mounts info lives in session context as a reminder message, injected on
+	// events (connect, mount change, compaction) — not rebuilt on every turn.
+	function findStoredMountsSignature(ctx: ExtensionContext): string | undefined {
+		for (const entry of [...ctx.sessionManager.getEntries()].reverse()) {
+			const value = entry as { type?: string; message?: { customType?: string; details?: { signature?: string } } };
+			if (value.type === "message" && value.message?.customType === MOUNTS_REMINDER_CUSTOM_TYPE)
+				return value.message.details?.signature;
+		}
+		return undefined;
+	}
+
+	async function injectMountsReminder(ctx: ExtensionContext, force: boolean): Promise<void> {
 		const mounts = runtime?.conversation.channel.gondolin?.mounts ?? [];
-		if (mounts.length === 0) return "";
-		const lines = mounts.map((mount) => {
-			const guest = mount.guestPath?.trim() || `/workspace/${basename(mount.hostPath)}`;
-			return `- ${guest} → ${mount.hostPath}${mount.readOnly === false ? " (read-write)" : " (read-only)"}`;
+		const signature = mountsSignature(mounts);
+		// A resumed session may already carry an up-to-date reminder — do not duplicate it.
+		if (lastMountsReminderSignature === undefined) lastMountsReminderSignature = findStoredMountsSignature(ctx);
+		if (!force && (mounts.length === 0 || signature === lastMountsReminderSignature)) return;
+		const body = formatMountsReminder(mounts) || "Project mounts: none. No host folder is mounted into the VM.";
+		await pi.sendMessage({
+			customType: MOUNTS_REMINDER_CUSTOM_TYPE,
+			content: body,
+			display: true,
+			details: { signature },
 		});
-		return `\n\nMounted host folders (host paths are reachable through these guest paths only):\n${lines.join("\n")}`;
+		lastMountsReminderSignature = signature;
 	}
 
 	async function buildSystemMdSuffix(): Promise<string> {
@@ -854,12 +882,19 @@ export default function (pi: ExtensionAPI) {
 		setChatToolsActive(true);
 		if (interactive) ctx.ui.notify(`Connected ${conversation.conversationName}`, "info");
 		await showChatContextMessage();
+		await injectMountsReminder(ctx, false);
 		updateStatus(ctx);
 		await tryDispatch(ctx);
 		return true;
 	}
 
 	pi.registerMessageRenderer("chat-context", (message, _options, theme) => {
+		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+		box.addChild(new Text(`${theme.fg("accent", theme.bold("[pi-chat]"))} ${String(message.content)}`, 0, 0));
+		return box;
+	});
+
+	pi.registerMessageRenderer(MOUNTS_REMINDER_CUSTOM_TYPE, (message, _options, theme) => {
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 		box.addChild(new Text(`${theme.fg("accent", theme.bold("[pi-chat]"))} ${String(message.content)}`, 0, 0));
 		return box;
@@ -1152,6 +1187,7 @@ export default function (pi: ExtensionAPI) {
 			pendingChatDispatch = true;
 			liveConnection?.setReplyTo(activeTriggerMessageId);
 			startTypingLoop();
+			await injectMountsReminder(ctx, false);
 			pi.sendUserMessage(next.prompt);
 			updateStatus(ctx);
 		} catch (error) {
@@ -1189,6 +1225,7 @@ export default function (pi: ExtensionAPI) {
 		const current = runtime;
 		runtime = undefined;
 		chatTurnInFlight = false;
+		lastMountsReminderSignature = undefined;
 		await current.disconnect();
 		if (clearPersistedState) persistChatState(undefined);
 		updateStatus(ctx);
@@ -1274,6 +1311,108 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("chat-project-mount", {
+		description: "Mount a host folder into the VM: /chat-project-mount [path] [ro|rw|unmount]",
+		handler: async (args, ctx) => {
+			await loadConfigOnce();
+			if (!runtime) {
+				ctx.ui.notify("No chat conversation connected. Use /chat-connect first.", "warning");
+				return;
+			}
+			let mode: "ro" | "rw" | "unmount" = "ro"; // ADR 0002 default: read-only
+			let rawPath = "";
+			for (const token of args.trim().split(/\s+/).filter(Boolean)) {
+				if (token === "ro" || token === "rw" || token === "unmount") mode = token;
+				else rawPath = token;
+			}
+			const conversationId = runtime.conversation.conversationId;
+			const config = await loadChatConfig();
+			const conversation = resolveConversation(config, conversationId);
+			if (!conversation) {
+				ctx.ui.notify("Connected conversation is no longer in the config.", "warning");
+				return;
+			}
+			const account = config.accounts[conversation.accountId];
+			const channel = account?.channels[conversation.channelKey];
+			if (!account || !channel) {
+				ctx.ui.notify("Connected conversation is no longer in the config.", "warning");
+				return;
+			}
+			// Mounts only take effect in a fresh VM, so a change restarts the sandbox.
+			const applyAndRestart = async (): Promise<void> => {
+				const action = async () => {
+					await restartSandbox(ctx, conversationId);
+				};
+				if (chatTurnInFlight || !ctx.isIdle()) {
+					pendingControlAction = action;
+					ctx.abort();
+					ctx.ui.notify("Aborting current turn, then restarting sandbox.", "info");
+					return;
+				}
+				await action();
+			};
+			if (mode === "unmount") {
+				const mounts = channel.gondolin?.mounts ?? [];
+				if (!mounts.some((mount) => mount.guestPath === PROJECT_MOUNT_GUEST_PATH)) {
+					ctx.ui.notify("No project mount to unmount.", "info");
+					return;
+				}
+				channel.gondolin = { ...channel.gondolin, mounts: removeProjectMount(mounts) };
+				await saveChatConfig(config);
+				// ADR 0002: worktrees are never removed automatically — uncommitted edits may live there.
+				ctx.ui.notify(`Unmounted ${PROJECT_MOUNT_GUEST_PATH}. Any worktree copy was kept.`, "info");
+				await applyAndRestart();
+				await injectMountsReminder(ctx, true);
+				return;
+			}
+			let hostPath: string;
+			try {
+				hostPath = await realpath(rawPath || ctx.cwd);
+				if (!(await lstat(hostPath)).isDirectory()) throw new Error("not a directory");
+			} catch {
+				ctx.ui.notify(`Path is not an existing directory: ${rawPath || ctx.cwd}`, "warning");
+				return;
+			}
+			// Git repo → rw uses a worktree copy; ro binds the original read-only (ADR 0002).
+			const probe = spawnSync("git", ["-C", hostPath, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
+			const repoRoot = probe.status === 0 ? probe.stdout.trim() : undefined;
+			let entry: GondolinMountConfig;
+			if (mode === "ro" || !repoRoot) {
+				entry = { hostPath, guestPath: PROJECT_MOUNT_GUEST_PATH, readOnly: mode === "ro" };
+			} else {
+				const worktreePath = join(conversation.conversationDir, "worktrees", deriveWorktreeSlug(hostPath, repoRoot));
+				if (existsSync(worktreePath)) {
+					// Reuse: the worktree may hold uncommitted edits; never recreate or delete it (ADR 0002).
+					const existing = spawnSync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], {
+						encoding: "utf8",
+					});
+					if (existing.status !== 0) {
+						ctx.ui.notify(
+							`Cannot mount: ${worktreePath} exists but is not a git worktree. Clean it up manually.`,
+							"warning",
+						);
+						return;
+					}
+				} else {
+					await mkdir(join(conversation.conversationDir, "worktrees"), { recursive: true });
+					const added = spawnSync("git", ["-C", repoRoot, "worktree", "add", worktreePath], { encoding: "utf8" });
+					if (added.status !== 0) {
+						ctx.ui.notify(`git worktree add failed: ${added.stderr.trim() || added.error?.message}`, "warning");
+						return;
+					}
+				}
+				entry = { hostPath: worktreePath, guestPath: PROJECT_MOUNT_GUEST_PATH, readOnly: false, worktree: true };
+			}
+			channel.gondolin = { ...channel.gondolin, mounts: upsertProjectMount(channel.gondolin?.mounts ?? [], entry) };
+			await saveChatConfig(config);
+			ctx.ui.notify(
+				`Mounted ${hostPath} at ${PROJECT_MOUNT_GUEST_PATH} (${mode === "rw" && entry.worktree ? "rw, worktree copy" : mode}).`,
+				"info",
+			);
+			await applyAndRestart();
+			await injectMountsReminder(ctx, true);
+		},
+	});
 	pi.registerCommand("chat-list", {
 		description: "List configured channels",
 		handler: async (_args, ctx) => {
@@ -1463,6 +1602,11 @@ export default function (pi: ExtensionAPI) {
 		await disconnectRuntime(ctx, reason === "quit");
 	});
 
+	// ADR 0002: compaction sweeps the mounts reminder out of context — re-inject it.
+	pi.on("session_compact", async (_event, ctx) => {
+		if (runtime) await injectMountsReminder(ctx, true);
+	});
+
 	pi.on("agent_start", async (_event, _ctx) => {});
 
 	pi.on("context", async (event) => {
@@ -1495,8 +1639,7 @@ export default function (pi: ExtensionAPI) {
 				buildChatSystemPromptSuffix(service, mode, channelName) +
 				memorySuffix +
 				skillsSuffix +
-				systemMdSuffix +
-				buildMountsSuffix(),
+				systemMdSuffix,
 		};
 	});
 
