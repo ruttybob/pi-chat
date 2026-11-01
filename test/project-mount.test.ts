@@ -36,21 +36,17 @@ test("stacked mount reminders collapse to the latest when no assistant reply sep
 		msg("custom", "chat-mounts"),
 	];
 	const result = collapseMountsReminders(messages);
-	assert.deepEqual(
-		result.filter((m) => m.customType === "chat-mounts").length,
-		1,
-	);
+	assert.deepEqual(result.filter((m) => m.customType === "chat-mounts").length, 1);
 	assert.equal(result.at(-1)?.customType, "chat-mounts");
 	assert.equal(result.filter((m) => m.customType === "chat-context").length, 1);
-	assert.deepEqual(result.filter((m) => m.role === "user"), [msg("user"), msg("user")]);
+	assert.deepEqual(
+		result.filter((m) => m.role === "user"),
+		[msg("user"), msg("user")],
+	);
 });
 
 test("mount reminders separated by assistant replies are all kept", () => {
-	const messages = [
-		msg("custom", "chat-mounts"),
-		msg("assistant"),
-		msg("custom", "chat-mounts"),
-	];
+	const messages = [msg("custom", "chat-mounts"), msg("assistant"), msg("custom", "chat-mounts")];
 	assert.equal(collapseMountsReminders(messages).length, 3);
 });
 
