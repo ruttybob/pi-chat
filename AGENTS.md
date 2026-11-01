@@ -112,7 +112,7 @@ Parsed by `ConversationRuntime.parseControlCommand()`: `stop`, `new`, `compact`,
 
 - `npm run check` = biome + tsc.
 - No ambient host env leaks into VM.
-- All paths shown to the model use guest-relative paths (`/workspace/...`, `/shared/...`).
+- All paths shown to the model use guest-relative paths (`/workspace/...`, `/shared/...`). One exception (ADR 0002): the mounts reminder names the host source folder so the model knows what `/workspace/project` maps to.
 - Transcript lines include `[uid:ID]` for tamper-resistant user identification.
 
 ## Agent skills

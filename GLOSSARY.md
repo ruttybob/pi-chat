@@ -17,5 +17,5 @@ _Avoid_: triggered turn, bot turn
 _Avoid_: cwd mount, project dir mount
 
 **Remote MCP Allowlist**:
-Список MCP-инструментов (по-инструментно, на аккаунт), доступных агенту в remote-ходах. Ведётся на хосте; из VM недоступен для записи.
+Список MCP-инструментов (по-инструментно, на аккаунт), доступных агенту на всю подключённую сессию — и в интерактиве, и в remote-ходах. Ведётся на хосте; из VM недоступен для записи.
 _Avoid_: shared MCP config, MCP whitelist
