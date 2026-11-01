@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	collapseMountsReminders,
 	deriveWorktreeSlug,
 	ensureWorktree,
 	formatMountsReminder,
@@ -17,6 +18,46 @@ import {
 
 test("project mount uses the fixed guest path (ADR 0002)", () => {
 	assert.equal(PROJECT_MOUNT_GUEST_PATH, "/workspace/project");
+});
+
+// Mounts reminders collapse in LLM context: a reminder is superseded by a newer
+// one unless a real assistant reply separates them (feedback, 2026-11-01).
+type CtxMsg = { role?: string; customType?: string };
+const msg = (role: string, customType?: string): CtxMsg => ({ role, customType });
+
+test("stacked mount reminders collapse to the latest when no assistant reply separates them", () => {
+	const messages = [
+		msg("user", undefined),
+		msg("custom", "chat-mounts"),
+		msg("custom", "chat-mounts"),
+		msg("custom", "chat-context"),
+		msg("custom", "chat-mounts"),
+		msg("user"),
+		msg("custom", "chat-mounts"),
+	];
+	const result = collapseMountsReminders(messages);
+	assert.deepEqual(
+		result.filter((m) => m.customType === "chat-mounts").length,
+		1,
+	);
+	assert.equal(result.at(-1)?.customType, "chat-mounts");
+	assert.equal(result.filter((m) => m.customType === "chat-context").length, 1);
+	assert.deepEqual(result.filter((m) => m.role === "user"), [msg("user"), msg("user")]);
+});
+
+test("mount reminders separated by assistant replies are all kept", () => {
+	const messages = [
+		msg("custom", "chat-mounts"),
+		msg("assistant"),
+		msg("custom", "chat-mounts"),
+	];
+	assert.equal(collapseMountsReminders(messages).length, 3);
+});
+
+test("context without mount reminders is returned unchanged", () => {
+	const messages = [msg("user"), msg("assistant"), msg("custom", "chat-context")];
+	assert.deepEqual(collapseMountsReminders(messages), messages);
+	assert.deepEqual(collapseMountsReminders([msg("custom", "chat-mounts")]), [msg("custom", "chat-mounts")]);
 });
 
 test("worktree slug is sanitized, stable, and distinct per repo", () => {

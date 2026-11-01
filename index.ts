@@ -45,9 +45,11 @@ import { callTelegramApi } from "./src/live/telegram.js";
 import type { LiveConnection } from "./src/live/types.js";
 import { appendRemoteError, appendRemoteInbound } from "./src/log.js";
 import {
+	collapseMountsReminders,
 	deriveWorktreeSlug,
 	ensureWorktree,
 	formatMountsReminder,
+	MOUNTS_REMINDER_CUSTOM_TYPE,
 	mountsSignature,
 	PROJECT_MOUNT_GUEST_PATH,
 	removeProjectMount,
@@ -115,7 +117,6 @@ type PersistedChatState = {
 };
 
 const SESSION_STATE_CUSTOM_TYPE = "pi-chat-state";
-const MOUNTS_REMINDER_CUSTOM_TYPE = "chat-mounts";
 const CHAT_CONVERSATION_FLAG = "chat-conversation";
 const WORKER_TMUX_PREFIX = "pi-chat-worker-";
 const DASHBOARD_TMUX_SESSION = "pi-chat-dashboard";
@@ -1652,12 +1653,11 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_start", async (_event, _ctx) => {});
 
 	pi.on("context", async (event) => {
-		return {
-			messages: event.messages.filter((message) => {
-				const value = message as unknown as Record<string, unknown>;
-				return !(value && value.customType === "chat-context");
-			}),
-		};
+		const withoutChatContext = event.messages.filter((message) => {
+			const value = message as unknown as Record<string, unknown>;
+			return !(value && value.customType === "chat-context");
+		});
+		return { messages: collapseMountsReminders(withoutChatContext) };
 	});
 
 	pi.on("before_agent_start", async (event) => {

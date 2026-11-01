@@ -6,6 +6,35 @@ import type { GondolinMountConfig } from "./core/config-types.js";
 // ADR 0002: the project mount always appears at this guest path.
 export const PROJECT_MOUNT_GUEST_PATH = "/workspace/project";
 
+// customType of the persistent mounts reminder message.
+export const MOUNTS_REMINDER_CUSTOM_TYPE = "chat-mounts";
+
+// Mounts reminders are superseded in LLM context by a newer one unless a real
+// assistant reply separates them: without this, toggling mounts between turns
+// stacks one user-visible message per change in the model's context.
+export function collapseMountsReminders<T extends { role?: unknown; customType?: unknown }>(
+	messages: readonly T[],
+): T[] {
+	const reminderIdx: number[] = [];
+	messages.forEach((message, index) => {
+		if (message?.role === "custom" && message.customType === MOUNTS_REMINDER_CUSTOM_TYPE) reminderIdx.push(index);
+	});
+	if (reminderIdx.length <= 1) return [...messages];
+	const superseded = new Set<number>();
+	for (let k = 0; k < reminderIdx.length - 1; k++) {
+		let hasAssistantReply = false;
+		for (let i = reminderIdx[k] + 1; i < reminderIdx[k + 1]; i++) {
+			if (messages[i]?.role === "assistant") {
+				hasAssistantReply = true;
+				break;
+			}
+		}
+		if (!hasAssistantReply) superseded.add(reminderIdx[k]);
+	}
+	if (superseded.size === 0) return [...messages];
+	return messages.filter((_, index) => !superseded.has(index));
+}
+
 // djb2 → 8 hex chars; keeps same-basename projects from colliding under worktrees/.
 function shortHash(value: string): string {
 	let hash = 5381;
