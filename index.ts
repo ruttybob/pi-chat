@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { type Dirent, existsSync, constants as fsConstants } from "node:fs";
-import { lstat, mkdir, open, readdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { basename, extname, isAbsolute, join, relative } from "node:path";
+import { existsSync } from "node:fs";
+import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { ensureGuestAssets, hasGuestAssets } from "@earendil-works/gondolin";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
@@ -31,6 +31,7 @@ import {
 import type { GondolinMountConfig, ResolvedConversation, TelegramAccountConfig } from "./src/core/config-types.js";
 import { ensureUniqueKey, makeChannelKey } from "./src/core/keys.js";
 import type { InboundMessageInput } from "./src/core/runtime-types.js";
+import { CHAT_TOOLS, conversationBoundSessionTools } from "./src/core/tool-surface.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
 import { type AccountFeed, startAccountFeed } from "./src/live/feed.js";
 import { connectLive } from "./src/live/index.js";
@@ -47,6 +48,7 @@ import {
 } from "./src/project-mount.js";
 import { ConversationRuntime } from "./src/runtime.js";
 import { createSecretRequest, tryDecryptSecret } from "./src/secrets.js";
+import { type ChatPromptSkill, loadSafeChatSkills, safeReadMountedText } from "./src/skills.js";
 import { runChatConfigUI } from "./src/tui/chat-config.js";
 import { runWithLoader, selectItem, showNotice } from "./src/tui/dialogs.js";
 
@@ -79,8 +81,8 @@ System configuration:
 
 Skills:
 - You can create reusable tools as skills.
-- Account-wide skills go in /shared/skills/, channel-specific in /workspace/skills/.
-- A skill is either a single .md file (e.g. skills/foo.md) or a directory with a SKILL.md plus any supporting files like scripts, configs, or data (e.g. skills/foo/SKILL.md, skills/foo/run.sh).
+- Skills live in /shared/.pi/skills/ and are shared across all channels of the account.
+- A skill is either a single .md file (e.g. .pi/skills/foo.md) or a directory with a SKILL.md plus any supporting files like scripts, configs, or data (e.g. .pi/skills/foo/SKILL.md, .pi/skills/foo/run.sh).
 - Each skill needs YAML frontmatter:
   ---
   name: skill-name
@@ -109,8 +111,6 @@ const SESSION_STATE_CUSTOM_TYPE = "pi-chat-state";
 const MOUNTS_REMINDER_CUSTOM_TYPE = "chat-mounts";
 const CHAT_CONVERSATION_FLAG = "chat-conversation";
 const WORKER_TMUX_PREFIX = "pi-chat-worker-";
-// Direct chat tools: declared to the model only while a conversation is connected.
-const CHAT_TOOLS = ["chat_history", "chat_attach", "chat_workers", "chat_request_secret"];
 const DASHBOARD_TMUX_SESSION = "pi-chat-dashboard";
 const WORKER_STATUS_DIR = join(CHAT_HOME, "worker-status");
 
@@ -135,17 +135,6 @@ interface WorkerStatusSnapshot {
 	lastError?: string;
 }
 
-interface ChatPromptSkill {
-	name: string;
-	description: string;
-	filePath: string;
-}
-
-function isInsideHostPath(root: string, value: string): boolean {
-	const rel = relative(root, value);
-	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
 function escapeXml(value: string): string {
 	return value
 		.replace(/&/g, "&amp;")
@@ -153,85 +142,6 @@ function escapeXml(value: string): string {
 		.replace(/>/g, "&gt;")
 		.replace(/"/g, "&quot;")
 		.replace(/'/g, "&apos;");
-}
-
-async function safeReadMountedText(root: string, filePath: string): Promise<string> {
-	try {
-		const realRoot = await realpath(root);
-		const resolvedPath = await realpath(filePath);
-		if (!isInsideHostPath(realRoot, resolvedPath)) return "";
-		const handle = await open(resolvedPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-		try {
-			const info = await handle.stat();
-			if (!info.isFile()) return "";
-			return await handle.readFile("utf8");
-		} finally {
-			await handle.close();
-		}
-	} catch {
-		return "";
-	}
-}
-
-function parseSkillFrontmatter(content: string): { name?: string; description?: string; disabled?: boolean } {
-	const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-	if (!match) return {};
-	const frontmatter: { name?: string; description?: string; disabled?: boolean } = {};
-	for (const line of match[1].split(/\r?\n/)) {
-		const separator = line.indexOf(":");
-		if (separator <= 0) continue;
-		const key = line.slice(0, separator).trim();
-		const rawValue = line
-			.slice(separator + 1)
-			.trim()
-			.replace(/^['"]|['"]$/g, "");
-		if (key === "name") frontmatter.name = rawValue;
-		if (key === "description") frontmatter.description = rawValue;
-		if (key === "disable-model-invocation") frontmatter.disabled = rawValue === "true";
-	}
-	return frontmatter;
-}
-
-async function loadSafeChatSkills(root: string): Promise<ChatPromptSkill[]> {
-	const skillsRoot = join(root, "skills");
-	const skills: ChatPromptSkill[] = [];
-	async function addSkill(filePath: string, defaultName: string): Promise<void> {
-		const content = await safeReadMountedText(root, filePath);
-		const frontmatter = parseSkillFrontmatter(content);
-		if (!frontmatter.description?.trim() || frontmatter.disabled) return;
-		skills.push({ name: frontmatter.name || defaultName, description: frontmatter.description, filePath });
-	}
-	async function walkSkills(dir: string, depth: number): Promise<void> {
-		if (depth > 8) return;
-		let entries: Dirent<string>[];
-		try {
-			entries = await readdir(dir, { withFileTypes: true });
-		} catch {
-			return;
-		}
-		for (const entry of entries) {
-			if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.isSymbolicLink()) continue;
-			const fullPath = join(dir, entry.name);
-			if (entry.isFile() && extname(entry.name).toLowerCase() === ".md") {
-				await addSkill(fullPath, basename(entry.name, ".md"));
-				continue;
-			}
-			if (!entry.isDirectory()) continue;
-			const skillMd = join(fullPath, "SKILL.md");
-			try {
-				const info = await lstat(skillMd);
-				if (info.isFile()) {
-					await addSkill(skillMd, entry.name);
-					continue;
-				}
-			} catch {
-				// Not a skill root; recurse below.
-			}
-			await walkSkills(fullPath, depth + 1);
-		}
-	}
-	await walkSkills(skillsRoot, 0);
-	return skills;
 }
 
 function formatChatSkillsForPrompt(skills: ChatPromptSkill[]): string {
@@ -566,13 +476,10 @@ export default function (pi: ExtensionAPI) {
 
 	async function buildSkillsPromptSuffix(): Promise<string> {
 		if (!runtime) return "";
-		const sharedSkills = await loadSafeChatSkills(runtime.conversation.sharedDir);
-		const channelSkills = await loadSafeChatSkills(runtime.conversation.workspaceDir);
-		const skillMap = new Map<string, ChatPromptSkill>();
-		for (const skill of sharedSkills) skillMap.set(skill.name, skill);
-		for (const skill of channelSkills) skillMap.set(skill.name, skill);
-		const allSkills = [...skillMap.values()].map((skill) => ({ ...skill, filePath: hostToGuestPath(skill.filePath) }));
-		const formatted = formatChatSkillsForPrompt(allSkills);
+		const skills = await loadSafeChatSkills(runtime.conversation.sharedDir);
+		const formatted = formatChatSkillsForPrompt(
+			skills.map((skill) => ({ ...skill, filePath: hostToGuestPath(skill.filePath) })),
+		);
 		return formatted ? `\n\nAvailable skills:\n${formatted}` : "";
 	}
 
@@ -686,12 +593,22 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	}
 
-	// Chat tools appear only while a conversation is connected; everything else that is
-	// active (file tools, bg, subagent, ...) stays untouched. With codemode.mode = "only"
-	// the model reaches direct tools through codemode scripts instead of declarations.
+	let unconnectedActiveTools: string[] | undefined;
+
+	// Conversation-bound sessions run inside the VM: restrict the declared surface to
+	// VM delegates, chat tools and codemode (conversationBoundSessionTools, ADR 0001);
+	// disconnect restores the pre-connect set. Remote turns stay guarded by the
+	// tool_call hook below. With codemode.mode = "only" the model reaches the file
+	// tools through codemode scripts instead of declarations.
 	function setChatToolsActive(chatConnected: boolean): void {
-		const withoutChat = pi.getActiveTools().filter((name) => !CHAT_TOOLS.includes(name));
-		pi.setActiveTools(chatConnected ? [...withoutChat, ...CHAT_TOOLS] : withoutChat);
+		if (chatConnected) {
+			unconnectedActiveTools = pi.getActiveTools();
+			pi.setActiveTools(conversationBoundSessionTools(pi.getAllTools().map((tool) => tool.name)));
+			return;
+		}
+		const restored = unconnectedActiveTools ?? pi.getActiveTools();
+		unconnectedActiveTools = undefined;
+		pi.setActiveTools(restored.filter((name) => !CHAT_TOOLS.includes(name)));
 	}
 
 	async function registerTopicChannel(chatId: string, threadId: number, name: string): Promise<string | undefined> {

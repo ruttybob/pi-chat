@@ -81,14 +81,13 @@ Telegram ←→ Account feed ←→ Runtime (log, jobs, slices) ←→ pi agent
 ├── accounts/<account>/
 │   ├── feed.lock / feed.json      → getUpdates leadership + cursor
 │   ├── shared/                    → /shared in VM
-│   │   ├── memory.md
-│   │   └── skills/
+│   │   ├── .pi/skills/            → account-wide chat skills (single source)
+│   │   └── memory.md
 │   └── channels/<channel>/
 │       ├── channel.jsonl
 │       ├── .lock / .lock.append
 │       ├── workspace/             → /workspace in VM (per topic)
 │       │   ├── memory.md
-│       │   ├── skills/
 │       │   ├── incoming/
 │       │   ├── .secrets/
 │       │   └── SYSTEM.md
