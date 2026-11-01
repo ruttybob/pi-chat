@@ -42,7 +42,7 @@ export function parseSkillFrontmatter(content: string): { name?: string; descrip
 		const rawValue = line
 			.slice(separator + 1)
 			.trim()
-			.replace(/^['"|"]'$/g, "");
+			.replace(/^['"]|['"]$/g, "");
 		if (key === "name") frontmatter.name = rawValue;
 		if (key === "description") frontmatter.description = rawValue;
 		if (key === "disable-model-invocation") frontmatter.disabled = rawValue === "true";
