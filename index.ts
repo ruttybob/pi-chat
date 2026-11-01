@@ -30,6 +30,7 @@ import {
 import type { ResolvedConversation, TelegramAccountConfig } from "./src/core/config-types.js";
 import { ensureUniqueKey, makeChannelKey } from "./src/core/keys.js";
 import type { InboundMessageInput } from "./src/core/runtime-types.js";
+import { CHAT_TOOLS, conversationBoundSessionTools } from "./src/core/tool-surface.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
 import { type AccountFeed, startAccountFeed } from "./src/live/feed.js";
 import { connectLive } from "./src/live/index.js";
@@ -100,8 +101,6 @@ type PersistedChatState = {
 const SESSION_STATE_CUSTOM_TYPE = "pi-chat-state";
 const CHAT_CONVERSATION_FLAG = "chat-conversation";
 const WORKER_TMUX_PREFIX = "pi-chat-worker-";
-// Direct chat tools: declared to the model only while a conversation is connected.
-const CHAT_TOOLS = ["chat_history", "chat_attach", "chat_workers", "chat_request_secret"];
 const DASHBOARD_TMUX_SESSION = "pi-chat-dashboard";
 const WORKER_STATUS_DIR = join(CHAT_HOME, "worker-status");
 
@@ -566,12 +565,22 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	}
 
-	// Chat tools appear only while a conversation is connected; everything else that is
-	// active (file tools, bg, subagent, ...) stays untouched. With codemode.mode = "only"
-	// the model reaches direct tools through codemode scripts instead of declarations.
+	let unconnectedActiveTools: string[] | undefined;
+
+	// Conversation-bound sessions run inside the VM: restrict the declared surface to
+	// VM delegates, chat tools and codemode (conversationBoundSessionTools, ADR 0001);
+	// disconnect restores the pre-connect set. Remote turns stay guarded by the
+	// tool_call hook below. With codemode.mode = "only" the model reaches the file
+	// tools through codemode scripts instead of declarations.
 	function setChatToolsActive(chatConnected: boolean): void {
-		const withoutChat = pi.getActiveTools().filter((name) => !CHAT_TOOLS.includes(name));
-		pi.setActiveTools(chatConnected ? [...withoutChat, ...CHAT_TOOLS] : withoutChat);
+		if (chatConnected) {
+			unconnectedActiveTools = pi.getActiveTools();
+			pi.setActiveTools(conversationBoundSessionTools(pi.getAllTools().map((tool) => tool.name)));
+			return;
+		}
+		const restored = unconnectedActiveTools ?? pi.getActiveTools();
+		unconnectedActiveTools = undefined;
+		pi.setActiveTools(restored.filter((name) => !CHAT_TOOLS.includes(name)));
 	}
 
 	async function registerTopicChannel(chatId: string, threadId: number, name: string): Promise<string | undefined> {
