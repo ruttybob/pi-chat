@@ -1,10 +1,10 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-
 import {
 	CHAT_CONFIG_PATH,
 	loadChatConfig,
 	removeAccountStorage,
 	removeChannelStorage,
+	sanitizeRemoteMcp,
 	saveChatConfig,
 } from "../config.js";
 import type {
@@ -16,6 +16,7 @@ import type {
 	TelegramAccountConfig,
 } from "../core/config-types.js";
 import type { DiscoveredUser, DiscoverySnapshot } from "../core/discovery-types.js";
+import type { RemoteMcpAllowlist } from "../core/tool-surface.js";
 import { loadDiscoverySnapshot } from "../discovery-store.js";
 import { refreshAccountSnapshot, updateAccountIdentityFromSnapshot } from "../services/index.js";
 import { selectItem, showNotice, toggleItems } from "./dialogs.js";
@@ -253,7 +254,7 @@ async function configureConfiguredChannel(
 	}
 }
 
-function remoteMcpSummary(remoteMcp: Record<string, string[]> | undefined): string {
+function remoteMcpSummary(remoteMcp: RemoteMcpAllowlist | undefined): string {
 	const servers = Object.keys(remoteMcp ?? {});
 	if (servers.length === 0) return "none — MCP unavailable in connected sessions";
 	const tools = Object.values(remoteMcp ?? {}).flat().length;
@@ -262,9 +263,10 @@ function remoteMcpSummary(remoteMcp: Record<string, string[]> | undefined): stri
 
 async function configureRemoteMcp(
 	ctx: ExtensionContext,
+	accountId: string,
 	title: string,
-	current: Record<string, string[]> | undefined,
-	save: (next: Record<string, string[]> | undefined) => Promise<void>,
+	current: RemoteMcpAllowlist | undefined,
+	save: (next: RemoteMcpAllowlist | undefined) => Promise<void>,
 ): Promise<void> {
 	while (true) {
 		const choice = await selectItem(ctx, title, [
@@ -303,7 +305,9 @@ async function configureRemoteMcp(
 		const next = { ...(current ?? {}) };
 		if (tools.length === 0) delete next[server];
 		else next[server] = tools;
-		const saved = Object.keys(next).length > 0 ? next : undefined;
+		// Shared validation is authoritative (src/config.ts); the inline checks above only
+		// give friendlier messages for the common mistakes.
+		const saved = sanitizeRemoteMcp(accountId, Object.keys(next).length > 0 ? next : undefined);
 		await save(saved);
 		current = saved;
 	}
@@ -353,6 +357,7 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 		if (choice === "remote-mcp") {
 			await configureRemoteMcp(
 				ctx,
+				accountId,
 				`${accountId} remote MCP (server → allowed tools)`,
 				account.remoteMcp,
 				async (next) => {
