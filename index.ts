@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { type Dirent, constants as fsConstants } from "node:fs";
-import { lstat, mkdir, open, readdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { basename, extname, isAbsolute, join, relative } from "node:path";
+import { existsSync } from "node:fs";
+import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { ensureGuestAssets, hasGuestAssets } from "@earendil-works/gondolin";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
@@ -24,21 +24,41 @@ import {
 	ensureChatHome,
 	listConfiguredConversations,
 	loadChatConfig,
+	readAccountRemoteMcp,
 	resolveConversation,
 	saveChatConfig,
 } from "./src/config.js";
 
-import type { ResolvedConversation, TelegramAccountConfig } from "./src/core/config-types.js";
+import type { GondolinMountConfig, ResolvedConversation, TelegramAccountConfig } from "./src/core/config-types.js";
 import { ensureUniqueKey, makeChannelKey } from "./src/core/keys.js";
 import type { InboundMessageInput } from "./src/core/runtime-types.js";
+import {
+	conversationBoundSessionTools,
+	isMcpToolName,
+	REMOTE_TURN_TOOLS,
+	remoteMcpAllowedTools,
+	restoreUnconnectedTools,
+} from "./src/core/tool-surface.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
 import { type AccountFeed, startAccountFeed } from "./src/live/feed.js";
 import { connectLive } from "./src/live/index.js";
 import { callTelegramApi } from "./src/live/telegram.js";
 import type { LiveConnection } from "./src/live/types.js";
-import { appendRemoteInbound } from "./src/log.js";
+import { appendRemoteError, appendRemoteInbound } from "./src/log.js";
+import {
+	collapseMountsReminders,
+	deriveWorktreeSlug,
+	ensureWorktree,
+	formatMountsReminder,
+	MOUNTS_REMINDER_CUSTOM_TYPE,
+	mountsSignature,
+	projectMountGuestPath,
+	removeProjectMount,
+	upsertProjectMount,
+} from "./src/project-mount.js";
 import { ConversationRuntime } from "./src/runtime.js";
 import { createSecretRequest, tryDecryptSecret } from "./src/secrets.js";
+import { type ChatPromptSkill, loadSafeChatSkills, safeReadMountedText } from "./src/skills.js";
 import { runChatConfigUI } from "./src/tui/chat-config.js";
 import { runWithLoader, selectItem, showNotice } from "./src/tui/dialogs.js";
 
@@ -71,8 +91,8 @@ System configuration:
 
 Skills:
 - You can create reusable tools as skills.
-- Account-wide skills go in /shared/skills/, channel-specific in /workspace/skills/.
-- A skill is either a single .md file (e.g. skills/foo.md) or a directory with a SKILL.md plus any supporting files like scripts, configs, or data (e.g. skills/foo/SKILL.md, skills/foo/run.sh).
+- Skills live in /shared/.pi/skills/ and are shared across all channels of the account.
+- A skill is either a single .md file (e.g. .pi/skills/foo.md) or a directory with a SKILL.md plus any supporting files like scripts, configs, or data (e.g. .pi/skills/foo/SKILL.md, .pi/skills/foo/run.sh).
 - Each skill needs YAML frontmatter:
   ---
   name: skill-name
@@ -100,8 +120,6 @@ type PersistedChatState = {
 const SESSION_STATE_CUSTOM_TYPE = "pi-chat-state";
 const CHAT_CONVERSATION_FLAG = "chat-conversation";
 const WORKER_TMUX_PREFIX = "pi-chat-worker-";
-// Direct chat tools: declared to the model only while a conversation is connected.
-const CHAT_TOOLS = ["chat_history", "chat_attach", "chat_workers", "chat_request_secret"];
 const DASHBOARD_TMUX_SESSION = "pi-chat-dashboard";
 const WORKER_STATUS_DIR = join(CHAT_HOME, "worker-status");
 
@@ -126,17 +144,6 @@ interface WorkerStatusSnapshot {
 	lastError?: string;
 }
 
-interface ChatPromptSkill {
-	name: string;
-	description: string;
-	filePath: string;
-}
-
-function isInsideHostPath(root: string, value: string): boolean {
-	const rel = relative(root, value);
-	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
 function escapeXml(value: string): string {
 	return value
 		.replace(/&/g, "&amp;")
@@ -144,85 +151,6 @@ function escapeXml(value: string): string {
 		.replace(/>/g, "&gt;")
 		.replace(/"/g, "&quot;")
 		.replace(/'/g, "&apos;");
-}
-
-async function safeReadMountedText(root: string, filePath: string): Promise<string> {
-	try {
-		const realRoot = await realpath(root);
-		const resolvedPath = await realpath(filePath);
-		if (!isInsideHostPath(realRoot, resolvedPath)) return "";
-		const handle = await open(resolvedPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-		try {
-			const info = await handle.stat();
-			if (!info.isFile()) return "";
-			return await handle.readFile("utf8");
-		} finally {
-			await handle.close();
-		}
-	} catch {
-		return "";
-	}
-}
-
-function parseSkillFrontmatter(content: string): { name?: string; description?: string; disabled?: boolean } {
-	const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-	if (!match) return {};
-	const frontmatter: { name?: string; description?: string; disabled?: boolean } = {};
-	for (const line of match[1].split(/\r?\n/)) {
-		const separator = line.indexOf(":");
-		if (separator <= 0) continue;
-		const key = line.slice(0, separator).trim();
-		const rawValue = line
-			.slice(separator + 1)
-			.trim()
-			.replace(/^['"]|['"]$/g, "");
-		if (key === "name") frontmatter.name = rawValue;
-		if (key === "description") frontmatter.description = rawValue;
-		if (key === "disable-model-invocation") frontmatter.disabled = rawValue === "true";
-	}
-	return frontmatter;
-}
-
-async function loadSafeChatSkills(root: string): Promise<ChatPromptSkill[]> {
-	const skillsRoot = join(root, "skills");
-	const skills: ChatPromptSkill[] = [];
-	async function addSkill(filePath: string, defaultName: string): Promise<void> {
-		const content = await safeReadMountedText(root, filePath);
-		const frontmatter = parseSkillFrontmatter(content);
-		if (!frontmatter.description?.trim() || frontmatter.disabled) return;
-		skills.push({ name: frontmatter.name || defaultName, description: frontmatter.description, filePath });
-	}
-	async function walkSkills(dir: string, depth: number): Promise<void> {
-		if (depth > 8) return;
-		let entries: Dirent<string>[];
-		try {
-			entries = await readdir(dir, { withFileTypes: true });
-		} catch {
-			return;
-		}
-		for (const entry of entries) {
-			if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.isSymbolicLink()) continue;
-			const fullPath = join(dir, entry.name);
-			if (entry.isFile() && extname(entry.name).toLowerCase() === ".md") {
-				await addSkill(fullPath, basename(entry.name, ".md"));
-				continue;
-			}
-			if (!entry.isDirectory()) continue;
-			const skillMd = join(fullPath, "SKILL.md");
-			try {
-				const info = await lstat(skillMd);
-				if (info.isFile()) {
-					await addSkill(skillMd, entry.name);
-					continue;
-				}
-			} catch {
-				// Not a skill root; recurse below.
-			}
-			await walkSkills(fullPath, depth + 1);
-		}
-	}
-	await walkSkills(skillsRoot, 0);
-	return skills;
 }
 
 function formatChatSkillsForPrompt(skills: ChatPromptSkill[]): string {
@@ -449,6 +377,8 @@ export default function (pi: ExtensionAPI) {
 	let sandbox: ConversationSandbox | undefined;
 	let ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
 	let chatTurnInFlight = false;
+	// remoteMcp allowlist of the currently connected session's account (ADR 0001, ticket #3).
+	let connectedRemoteMcp: Record<string, string[]> | undefined;
 	let configLoadedAtLeastOnce = false;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let workerStatusInterval: ReturnType<typeof setInterval> | undefined;
@@ -456,21 +386,10 @@ export default function (pi: ExtensionAPI) {
 	let pendingChatDispatch = false;
 	let pendingControlAction: (() => Promise<void>) | undefined;
 	let activeTriggerMessageId: string | undefined;
+	let lastMountsReminderSignature: string | undefined;
 
 	function persistChatState(conversationId?: string): void {
 		pi.appendEntry<PersistedChatState>(SESSION_STATE_CUSTOM_TYPE, { conversationId });
-	}
-
-	function getPersistedConversationId(ctx: ExtensionContext): string | undefined {
-		const entries = ctx.sessionManager.getEntries();
-		for (let index = entries.length - 1; index >= 0; index--) {
-			const entry = entries[index] as unknown as Record<string, unknown>;
-			if (entry.type !== "custom" || entry.customType !== SESSION_STATE_CUSTOM_TYPE) continue;
-			const data = entry.data as PersistedChatState | undefined;
-			if (typeof data?.conversationId === "string" && data.conversationId.trim()) return data.conversationId;
-			return undefined;
-		}
-		return undefined;
 	}
 
 	function stableSecretsKey(secrets: Record<string, { value: string; hosts: string[] }>): string {
@@ -568,24 +487,38 @@ export default function (pi: ExtensionAPI) {
 
 	async function buildSkillsPromptSuffix(): Promise<string> {
 		if (!runtime) return "";
-		const sharedSkills = await loadSafeChatSkills(runtime.conversation.sharedDir);
-		const channelSkills = await loadSafeChatSkills(runtime.conversation.workspaceDir);
-		const skillMap = new Map<string, ChatPromptSkill>();
-		for (const skill of sharedSkills) skillMap.set(skill.name, skill);
-		for (const skill of channelSkills) skillMap.set(skill.name, skill);
-		const allSkills = [...skillMap.values()].map((skill) => ({ ...skill, filePath: hostToGuestPath(skill.filePath) }));
-		const formatted = formatChatSkillsForPrompt(allSkills);
+		const skills = await loadSafeChatSkills(runtime.conversation.sharedDir);
+		const formatted = formatChatSkillsForPrompt(
+			skills.map((skill) => ({ ...skill, filePath: hostToGuestPath(skill.filePath) })),
+		);
 		return formatted ? `\n\nAvailable skills:\n${formatted}` : "";
 	}
 
-	function buildMountsSuffix(): string {
+	// ADR 0002: mounts info lives in session context as a reminder message, injected on
+	// events (connect, mount change, compaction) — not rebuilt on every turn.
+	function findStoredMountsSignature(ctx: ExtensionContext): string | undefined {
+		for (const entry of [...ctx.sessionManager.getEntries()].reverse()) {
+			const value = entry as { type?: string; message?: { customType?: string; details?: { signature?: string } } };
+			if (value.type === "message" && value.message?.customType === MOUNTS_REMINDER_CUSTOM_TYPE)
+				return value.message.details?.signature;
+		}
+		return undefined;
+	}
+
+	async function injectMountsReminder(ctx: ExtensionContext, force: boolean): Promise<void> {
 		const mounts = runtime?.conversation.channel.gondolin?.mounts ?? [];
-		if (mounts.length === 0) return "";
-		const lines = mounts.map((mount) => {
-			const guest = mount.guestPath?.trim() || `/workspace/${basename(mount.hostPath)}`;
-			return `- ${guest} → ${mount.hostPath}${mount.readOnly === false ? " (read-write)" : " (read-only)"}`;
+		const signature = mountsSignature(mounts);
+		// A resumed session may already carry an up-to-date reminder — do not duplicate it.
+		if (lastMountsReminderSignature === undefined) lastMountsReminderSignature = findStoredMountsSignature(ctx);
+		if (!force && (mounts.length === 0 || signature === lastMountsReminderSignature)) return;
+		const body = formatMountsReminder(mounts) || "Project mounts: none. No host folder is mounted into the VM.";
+		await pi.sendMessage({
+			customType: MOUNTS_REMINDER_CUSTOM_TYPE,
+			content: body,
+			display: true,
+			details: { signature },
 		});
-		return `\n\nMounted host folders (host paths are reachable through these guest paths only):\n${lines.join("\n")}`;
+		lastMountsReminderSignature = signature;
 	}
 
 	async function buildSystemMdSuffix(): Promise<string> {
@@ -671,12 +604,37 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	}
 
-	// Chat tools appear only while a conversation is connected; everything else that is
-	// active (file tools, bg, subagent, ...) stays untouched. With codemode.mode = "only"
-	// the model reaches direct tools through codemode scripts instead of declarations.
+	let unconnectedActiveTools: string[] | undefined;
+
+	// Conversation-bound sessions run inside the VM: restrict the declared surface to
+	// VM delegates, chat tools and codemode (conversationBoundSessionTools, ADR 0001);
+	// disconnect restores the pre-connect set. Remote turns stay guarded by the
+	// tool_call hook below. With codemode.mode = "only" the model reaches the file
+	// tools through codemode scripts instead of declarations.
+	function applyConnectedTools(): void {
+		pi.setActiveTools(
+			conversationBoundSessionTools(
+				pi.getAllTools().map((tool) => tool.name),
+				remoteMcpAllowedTools(connectedRemoteMcp),
+			),
+		);
+	}
+
 	function setChatToolsActive(chatConnected: boolean): void {
-		const withoutChat = pi.getActiveTools().filter((name) => !CHAT_TOOLS.includes(name));
-		pi.setActiveTools(chatConnected ? [...withoutChat, ...CHAT_TOOLS] : withoutChat);
+		if (chatConnected) {
+			unconnectedActiveTools = pi.getActiveTools();
+			connectedRemoteMcp = runtime
+				? readAccountRemoteMcp(runtime.conversation.accountId, runtime.conversation.sharedDir)
+				: undefined;
+			applyConnectedTools();
+			return;
+		}
+		connectedRemoteMcp = undefined;
+		// Union of the pre-connect snapshot and the current set: tools enabled mid-session
+		// (e.g. MCP tools allowlisted after connect) survive the disconnect (ADR 0001).
+		const restored = restoreUnconnectedTools(unconnectedActiveTools ?? [], pi.getActiveTools());
+		unconnectedActiveTools = undefined;
+		pi.setActiveTools(restored);
 	}
 
 	async function registerTopicChannel(chatId: string, threadId: number, name: string): Promise<string | undefined> {
@@ -870,13 +828,39 @@ export default function (pi: ExtensionAPI) {
 							text: `Registered this topic as channel ${runtime.conversation.accountId}/${channelKey}. Run /chat-spawn-all on the host to start its worker.`,
 						}).catch(() => undefined);
 					},
-					onError: async (error) => {
-						if (runtime) await runtime.appendError(error.message);
+					onError: async (error, context) => {
+						const tag = context?.channelKey
+							? `[channel ${context.channelKey}] `
+							: context?.chatId
+								? `[chat ${context.chatId}] `
+								: "";
+						if (runtime && context?.channelKey) {
+							// Fan-out failure: record it in the affected channel's log, not ours.
+							const target = resolveConversation(
+								await loadChatConfig(),
+								`${runtime.conversation.accountId}/${context.channelKey}`,
+							);
+							if (target) {
+								await appendRemoteError(target, ownerId, error.message);
+								updateStatus(ctx, error.message);
+								return;
+							}
+						}
+						if (runtime) await runtime.appendError(`${tag}${error.message}`);
 						updateStatus(ctx, error.message);
 					},
 				},
 			});
 			runtime.armAfterCurrentTail();
+			// Q25: surface the remote-control commands in Telegram's UI (best effort).
+			void callTelegramApi((conversation.account as TelegramAccountConfig).botToken, "setMyCommands", {
+				commands: [
+					{ command: "new", description: "Start a new session" },
+					{ command: "compact", description: "Compact the session context" },
+					{ command: "status", description: "Show status" },
+					{ command: "stop", description: "Stop the current turn" },
+				],
+			}).catch(() => undefined);
 			logTailInterval = setInterval(() => {
 				void (async () => {
 					if (!runtime) return;
@@ -915,12 +899,19 @@ export default function (pi: ExtensionAPI) {
 		setChatToolsActive(true);
 		if (interactive) ctx.ui.notify(`Connected ${conversation.conversationName}`, "info");
 		await showChatContextMessage();
+		await injectMountsReminder(ctx, false);
 		updateStatus(ctx);
 		await tryDispatch(ctx);
 		return true;
 	}
 
 	pi.registerMessageRenderer("chat-context", (message, _options, theme) => {
+		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+		box.addChild(new Text(`${theme.fg("accent", theme.bold("[pi-chat]"))} ${String(message.content)}`, 0, 0));
+		return box;
+	});
+
+	pi.registerMessageRenderer(MOUNTS_REMINDER_CUSTOM_TYPE, (message, _options, theme) => {
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 		box.addChild(new Text(`${theme.fg("accent", theme.bold("[pi-chat]"))} ${String(message.content)}`, 0, 0));
 		return box;
@@ -1208,11 +1199,20 @@ export default function (pi: ExtensionAPI) {
 		}
 		try {
 			chatTurnInFlight = true;
+			// ADR 0001 (Q23): the allowlist lives in shared/mcp.json; each remote turn re-reads
+			// the file so edits reach detached workers without IPC or /chat-connect. A stale
+			// allowlist on a read failure is acceptable: the in-memory set still applies.
+			const freshMcp = readAccountRemoteMcp(runtime.conversation.accountId, runtime.conversation.sharedDir);
+			if (JSON.stringify(freshMcp ?? null) !== JSON.stringify(connectedRemoteMcp ?? null)) {
+				connectedRemoteMcp = freshMcp;
+				applyConnectedTools();
+			}
 			activeTriggerMessageId = next.triggerMessageId;
 			queuedOutboundAttachments = [];
 			pendingChatDispatch = true;
 			liveConnection?.setReplyTo(activeTriggerMessageId);
 			startTypingLoop();
+			await injectMountsReminder(ctx, false);
 			pi.sendUserMessage(next.prompt);
 			updateStatus(ctx);
 		} catch (error) {
@@ -1250,28 +1250,29 @@ export default function (pi: ExtensionAPI) {
 		const current = runtime;
 		runtime = undefined;
 		chatTurnInFlight = false;
+		lastMountsReminderSignature = undefined;
 		await current.disconnect();
 		if (clearPersistedState) persistChatState(undefined);
 		updateStatus(ctx);
 	}
 
 	pi.on("tool_call", async (event) => {
-		if (!chatTurnInFlight) return;
-		// "codemode" is how the model reaches the file tools (see codemode.mode = "only").
-		const remoteAllowed = [
-			"codemode",
-			"read",
-			"write",
-			"edit",
-			"bash",
-			"chat_attach",
-			"chat_history",
-			"chat_request_secret",
-		];
-		if (!remoteAllowed.includes(event.toolName)) {
+		if (!runtime) return;
+		// remoteMcp allowlist (ADR 0001): one rule for the whole connected session — interactive
+		// and remote turns alike; the hook also fires for nested codemode calls, which is the
+		// only barrier for codemode/deferred MCP tools.
+		const allowedMcp = remoteMcpAllowedTools(connectedRemoteMcp);
+		if (isMcpToolName(event.toolName) && !allowedMcp.has(event.toolName)) {
 			return {
 				block: true,
-				reason: "pi-chat remote turns only allow read, write, edit, bash, chat_history, and chat_attach",
+				reason: `MCP tool "${event.toolName}" is not in this account's remoteMcp allowlist (config.json)`,
+			};
+		}
+		if (!chatTurnInFlight) return;
+		if (!REMOTE_TURN_TOOLS.includes(event.toolName) && !allowedMcp.has(event.toolName)) {
+			return {
+				block: true,
+				reason: `pi-chat remote turns only allow ${REMOTE_TURN_TOOLS.join(", ")}, and allowlisted MCP tools`,
 			};
 		}
 		const configuredTools = runtime?.conversation.channel.tools;
@@ -1295,6 +1296,15 @@ export default function (pi: ExtensionAPI) {
 			const updatedConfig = await loadChatConfig();
 			const updatedConversation = resolveConversation(updatedConfig, conversationId);
 			if (!updatedConversation) return;
+			// remoteMcp now lives in shared/mcp.json and is re-read per remote turn (Q23);
+			// sync right away so interactive turns see file edits without reconnecting.
+			if (runtime) {
+				const freshMcp = readAccountRemoteMcp(runtime.conversation.accountId, runtime.conversation.sharedDir);
+				if (JSON.stringify(freshMcp ?? null) !== JSON.stringify(connectedRemoteMcp ?? null)) {
+					connectedRemoteMcp = freshMcp;
+					applyConnectedTools();
+				}
+			}
 			const afterSecrets = stableSecretsKey(updatedConversation.gondolinSecrets);
 			if (beforeSecrets === afterSecrets) return;
 			const confirm = await ctx.ui.confirm(
@@ -1315,6 +1325,172 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ADR 0002: no IPC — a detached worker rebuilds its sandbox only at (re)start, so mount
+	// changes made in another process (the interactive TUI) do not reach a live worker.
+	function notifyWorkerRestartNeeded(ctx: ExtensionContext, conversationId: string): void {
+		if (pi.getFlag(CHAT_CONVERSATION_FLAG)) return; // we ARE the worker; applyAndRestart covers us
+		if (!listTmuxSessions().has(tmuxSafeName(conversationId))) return;
+		ctx.ui.notify(
+			"A detached worker is connected to this channel: restart it (/chat-spawn-all --restart) so it picks up the new mounts.",
+			"warning",
+		);
+	}
+
+	pi.registerCommand("chat-project-mount", {
+		description: "Mount a host folder into the VM: /chat-project-mount [path] [ro|rw|unmount]",
+		getArgumentCompletions: (argumentText) => {
+			// getArgumentCompletions replaces the whole argument text, so a typed path must be echoed into each item value
+			const MODES = [
+				{ value: "ro", description: "read-only bind (default)" },
+				{ value: "rw", description: "writable worktree copy; source untouched" },
+				{ value: "unmount", description: "remove the mount (worktree kept)" },
+			] as const;
+			const tokens = argumentText.trim().split(/\s+/).filter(Boolean);
+			const last = tokens[tokens.length - 1] ?? "";
+			if (tokens.some((t) => MODES.some((m) => m.value === t))) return null;
+			if (!MODES.some((m) => m.value.startsWith(last))) return null;
+			const base = tokens.length > 1 ? tokens.slice(0, -1).join(" ") + " " : "";
+			return MODES.filter((m) => m.value.startsWith(last)).map((m) => ({
+				value: base + m.value,
+				label: base + m.value,
+				description: m.description,
+			}));
+		},
+		handler: async (args, ctx) => {
+			await loadConfigOnce();
+			if (!runtime) {
+				ctx.ui.notify("No chat conversation connected. Use /chat-connect first.", "warning");
+				return;
+			}
+			let mode: "ro" | "rw" | "unmount" = "ro"; // ADR 0002 default: read-only
+			let rawPath = "";
+			for (const token of args.trim().split(/\s+/).filter(Boolean)) {
+				if (token === "ro" || token === "rw" || token === "unmount") mode = token;
+				else rawPath = token;
+			}
+			const conversationId = runtime.conversation.conversationId;
+			const config = await loadChatConfig();
+			const conversation = resolveConversation(config, conversationId);
+			if (!conversation) {
+				ctx.ui.notify("Connected conversation is no longer in the config.", "warning");
+				return;
+			}
+			const account = config.accounts[conversation.accountId];
+			const channel = account?.channels[conversation.channelKey];
+			if (!account || !channel) {
+				ctx.ui.notify("Connected conversation is no longer in the config.", "warning");
+				return;
+			}
+			// Mounts only take effect in a fresh VM, so a change restarts the sandbox.
+			const applyAndRestart = async (): Promise<void> => {
+				const action = async () => {
+					await restartSandbox(ctx, conversationId);
+				};
+				if (chatTurnInFlight || !ctx.isIdle()) {
+					pendingControlAction = action;
+					ctx.abort();
+					ctx.ui.notify("Aborting current turn, then restarting sandbox.", "info");
+					return;
+				}
+				await action();
+			};
+			if (mode === "unmount") {
+				const mounts = channel.gondolin?.mounts ?? [];
+				if (mounts.length === 0) {
+					ctx.ui.notify("No project mounts.", "info");
+					return;
+				}
+				// With an argument, match by host path (original for ro, worktree copy for rw);
+				// without one, unmount the single mount or list what to choose from.
+				const candidates = new Set<string>();
+				if (rawPath) {
+					let resolved = rawPath;
+					try {
+						resolved = await realpath(rawPath);
+					} catch {
+						// not an existing path — still try the literal
+					}
+					candidates.add(resolved);
+					const slug = deriveWorktreeSlug(resolved);
+					candidates.add(join(conversation.conversationDir, "worktrees", slug));
+				} else if (mounts.length === 1) {
+					candidates.add(mounts[0].hostPath);
+				} else {
+					ctx.ui.notify(
+						`Multiple project mounts — specify which one: ${mounts.map((m) => m.hostPath).join(", ")}`,
+						"warning",
+					);
+					return;
+				}
+				const removed = mounts.filter((mount) => candidates.has(mount.hostPath));
+				if (removed.length === 0) {
+					ctx.ui.notify(`No project mount for ${rawPath}.`, "info");
+					return;
+				}
+				channel.gondolin = { ...channel.gondolin, mounts: removeProjectMount(mounts, [...candidates]) };
+				await saveChatConfig(config);
+				// ADR 0002: worktrees are never removed automatically — uncommitted edits may live there.
+				ctx.ui.notify(`Unmounted ${removed.map((m) => m.guestPath).join(", ")}. Any worktree copy was kept.`, "info");
+				await applyAndRestart();
+				await injectMountsReminder(ctx, true);
+				notifyWorkerRestartNeeded(ctx, conversation.conversationId);
+				return;
+			}
+			let hostPath: string;
+			try {
+				hostPath = await realpath(rawPath || ctx.cwd);
+				if (!(await lstat(hostPath)).isDirectory()) throw new Error("not a directory");
+			} catch {
+				ctx.ui.notify(`Path is not an existing directory: ${rawPath || ctx.cwd}`, "warning");
+				return;
+			}
+			// Git repo → rw uses a worktree copy; ro binds the original read-only (ADR 0002).
+			const probe = spawnSync("git", ["-C", hostPath, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
+			const repoRoot = probe.status === 0 ? probe.stdout.trim() : undefined;
+			let entry: GondolinMountConfig;
+			if (mode === "ro" || !repoRoot) {
+				entry = { hostPath, guestPath: projectMountGuestPath(hostPath, repoRoot), readOnly: mode === "ro" };
+			} else {
+				const slug = deriveWorktreeSlug(hostPath, repoRoot);
+				const worktreePath = join(conversation.conversationDir, "worktrees", slug);
+				if (existsSync(worktreePath)) {
+					// Reuse: the worktree may hold uncommitted edits; never recreate or delete it (ADR 0002).
+					const existing = spawnSync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], {
+						encoding: "utf8",
+					});
+					if (existing.status !== 0) {
+						ctx.ui.notify(
+							`Cannot mount: ${worktreePath} exists but is not a git worktree. Clean it up manually.`,
+							"warning",
+						);
+						return;
+					}
+				} else {
+					await mkdir(join(conversation.conversationDir, "worktrees"), { recursive: true });
+					const ensured = ensureWorktree(repoRoot, worktreePath, slug);
+					if (!ensured.ok) {
+						ctx.ui.notify(`git worktree add failed: ${ensured.error}`, "warning");
+						return;
+					}
+				}
+				entry = {
+					hostPath: worktreePath,
+					guestPath: projectMountGuestPath(hostPath, repoRoot),
+					readOnly: false,
+					worktree: true,
+				};
+			}
+			channel.gondolin = { ...channel.gondolin, mounts: upsertProjectMount(channel.gondolin?.mounts ?? [], entry) };
+			await saveChatConfig(config);
+			ctx.ui.notify(
+				`Mounted ${hostPath} at ${entry.guestPath} (${mode === "rw" && entry.worktree ? "rw, worktree copy" : mode}).`,
+				"info",
+			);
+			await applyAndRestart();
+			await injectMountsReminder(ctx, true);
+			notifyWorkerRestartNeeded(ctx, conversation.conversationId);
+		},
+	});
 	pi.registerCommand("chat-list", {
 		description: "List configured channels",
 		handler: async (_args, ctx) => {
@@ -1417,6 +1593,7 @@ export default function (pi: ExtensionAPI) {
 				spec = (await selectItem(ctx, "Connect pi-chat channel", items)) || "";
 				if (!spec) return;
 			}
+			registerVmFileTools(ctx);
 			await connectConversation(ctx, spec, true);
 		},
 	});
@@ -1431,7 +1608,10 @@ export default function (pi: ExtensionAPI) {
 					if (conversationId) sm.appendCustomEntry(SESSION_STATE_CUSTOM_TYPE, { conversationId });
 				},
 			});
-			if (!result.cancelled) return;
+			if (result.cancelled) return;
+			// Module state can survive the session switch: drop the mounts-reminder signature so
+			// the fresh session gets a reminder instead of being silenced by the old signature.
+			lastMountsReminderSignature = undefined;
 		},
 	});
 
@@ -1449,9 +1629,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		await loadConfigOnce();
-		ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
+	function registerVmFileTools(ctx: ExtensionContext): void {
 		const readDefinition = createReadToolDefinition(ctx.cwd);
 		const writeDefinition = createWriteToolDefinition(ctx.cwd);
 		const editDefinition = createEditToolDefinition(ctx.cwd);
@@ -1486,16 +1664,21 @@ export default function (pi: ExtensionAPI) {
 				return tool.execute(id, params, signal, onUpdate);
 			},
 		});
+	}
+
+	pi.on("session_start", async (_event, ctx) => {
+		await loadConfigOnce();
+		ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
+		// A new (or resumed) session must not inherit the previous session's mounts-reminder
+		// signature; injectMountsReminder re-derives it from this session's entries.
+		lastMountsReminderSignature = undefined;
 		// Chat tools appear only while a conversation is connected.
 		setChatToolsActive(false);
 		updateStatus(ctx);
 		const flaggedConversationId = pi.getFlag(CHAT_CONVERSATION_FLAG);
-		const persistedConversationId = getPersistedConversationId(ctx);
-		const conversationId =
-			typeof flaggedConversationId === "string" && flaggedConversationId.trim()
-				? flaggedConversationId.trim()
-				: persistedConversationId;
-		if (conversationId) await connectConversation(ctx, conversationId, false);
+		if (typeof flaggedConversationId !== "string" || !flaggedConversationId.trim()) return;
+		registerVmFileTools(ctx);
+		await connectConversation(ctx, flaggedConversationId.trim(), false);
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
@@ -1503,15 +1686,19 @@ export default function (pi: ExtensionAPI) {
 		await disconnectRuntime(ctx, reason === "quit");
 	});
 
+	// ADR 0002: compaction sweeps the mounts reminder out of context — re-inject it.
+	pi.on("session_compact", async (_event, ctx) => {
+		if (runtime) await injectMountsReminder(ctx, true);
+	});
+
 	pi.on("agent_start", async (_event, _ctx) => {});
 
 	pi.on("context", async (event) => {
-		return {
-			messages: event.messages.filter((message) => {
-				const value = message as unknown as Record<string, unknown>;
-				return !(value && value.customType === "chat-context");
-			}),
-		};
+		const withoutChatContext = event.messages.filter((message) => {
+			const value = message as unknown as Record<string, unknown>;
+			return !(value && value.customType === "chat-context");
+		});
+		return { messages: collapseMountsReminders(withoutChatContext) };
 	});
 
 	pi.on("before_agent_start", async (event) => {
@@ -1535,8 +1722,7 @@ export default function (pi: ExtensionAPI) {
 				buildChatSystemPromptSuffix(service, mode, channelName) +
 				memorySuffix +
 				skillsSuffix +
-				systemMdSuffix +
-				buildMountsSuffix(),
+				systemMdSuffix,
 		};
 	});
 

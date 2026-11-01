@@ -110,14 +110,13 @@ Per channel in `config.json`:
 │   ├── feed.lock                  → account getUpdates leadership
 │   ├── feed.json                  → account poller cursor / forum cache
 │   ├── shared/                    → /shared in VM (account-wide)
-│   │   ├── memory.md
-│   │   └── skills/
+│   │   ├── .pi/skills/            → account-wide chat skills (single source)
+│   │   └── memory.md
 │   └── channels/<channel>/
 │       ├── channel.jsonl
 │       ├── .lock / .lock.append
 │       ├── workspace/             → /workspace in VM (per topic!)
 │       │   ├── memory.md
-│       │   ├── skills/
 │       │   ├── incoming/
 │       │   ├── .secrets/
 │       │   └── SYSTEM.md

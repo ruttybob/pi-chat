@@ -23,10 +23,11 @@ export interface AccountFeedCallbacks {
 		own: boolean,
 	): Promise<void>;
 	onTopicCreated(chatId: string, threadId: number, name: string): Promise<void>;
-	// DM topics send no forum_topic_created service message, so the feed reports them
+	// DM topics send no forum_topic_created service message, and supergroup topics
+	// created while the bot was offline never send one — the feed reports such topics
 	// from the first message instead (only for chats that already have a channel).
 	onTopicObserved(chatId: string, threadId: number): Promise<void>;
-	onError(error: Error): Promise<void>;
+	onError(error: Error, context?: { chatId?: string; channelKey?: string }): Promise<void>;
 }
 
 interface FeedState {
@@ -100,15 +101,18 @@ export function startAccountFeed(options: {
 		const rawThread =
 			message.is_topic_message || message.message_thread_id !== undefined ? message.message_thread_id : undefined;
 		const threadedDm = message.chat.type === "private" && (await hasTopicsEnabled());
-		const threadId = rawThread ?? (threadedDm || (await isForum(chatId)) ? 1 : undefined);
+		// is_forum is supergroup-only, so private chats skip the getChat call.
+		const forum = threadedDm || (message.chat.type !== "private" && (await isForum(chatId)));
+		const threadId = rawThread ?? (forum ? 1 : undefined);
 		const findEntry = (config: ChatConfig) => {
 			const account = config.accounts[accountId];
 			if (!account || account.service !== "telegram") return undefined;
 			const exact = Object.entries(account.channels).find(
 				([, channel]: [string, ConfiguredChannel]) => channel.id === chatId && channel.threadId === threadId,
 			);
-			// General (thread 1) of a threaded DM maps to the pre-threaded DM channel.
-			if (!exact && threadedDm && threadId === 1)
+			// General (thread 1) maps to the pre-topics channel of a threaded DM or a
+			// forum supergroup configured before Topics were enabled.
+			if (!exact && forum && threadId === 1)
 				return Object.entries(account.channels).find(
 					([, channel]: [string, ConfiguredChannel]) => channel.id === chatId && channel.threadId === undefined,
 				);
@@ -116,9 +120,11 @@ export function startAccountFeed(options: {
 		};
 		let config = await loadChatConfig();
 		let entry = findEntry(config);
-		if (!entry && threadedDm && threadId !== undefined) {
+		if (!entry && forum && threadId !== undefined) {
 			// First message from an unknown topic lazily registers its channel — only inside
-			// an already-configured chat, so unknown DMs stay unregistered (trust boundary).
+			// an already-configured chat, so unknown chats stay unregistered (trust boundary).
+			// DM topics never send forum_topic_created; supergroup topics do, but it is
+			// missed when the topic is created while the bot is offline.
 			const account = config.accounts[accountId];
 			if (account?.service === "telegram" && Object.values(account.channels).some((channel) => channel.id === chatId)) {
 				await callbacks.onTopicObserved(chatId, threadId);
@@ -127,13 +133,22 @@ export function startAccountFeed(options: {
 			}
 		}
 		if (!entry) return;
-		const conversation = resolveConversation(config, `${accountId}/${entry[0]}`);
-		if (!conversation) return;
-		const account = config.accounts[accountId];
-		if (!account || account.service !== "telegram") return;
-		const input = await messageToInput(conversation, account as TelegramAccountConfig, message);
-		if (!input) return;
-		await callbacks.onInbound(conversation, input, entry[0] === ownChannelKey);
+		try {
+			const conversation = resolveConversation(config, `${accountId}/${entry[0]}`);
+			if (!conversation) return;
+			const account = config.accounts[accountId];
+			if (!account || account.service !== "telegram") return;
+			const input = await messageToInput(conversation, account as TelegramAccountConfig, message);
+			if (!input) return;
+			await callbacks.onInbound(conversation, input, entry[0] === ownChannelKey);
+		} catch (error) {
+			// Fan-out failure for this channel only: report its identity so the error lands
+			// in the right log, and let the poller keep dispatching to other channels.
+			await callbacks.onError(error instanceof Error ? error : new Error(String(error)), {
+				chatId,
+				channelKey: entry[0],
+			});
+		}
 	};
 
 	const flushMediaGroup = async (key: string): Promise<void> => {
@@ -162,7 +177,9 @@ export function startAccountFeed(options: {
 			if (entry.timer) clearTimeout(entry.timer);
 			entry.timer = setTimeout(() => {
 				void flushMediaGroup(key).catch(async (error) => {
-					await callbacks.onError(error instanceof Error ? error : new Error(String(error)));
+					await callbacks.onError(error instanceof Error ? error : new Error(String(error)), {
+						chatId: key.split(":")[0],
+					});
 				});
 			}, 1200);
 			mediaGroups.set(key, entry);

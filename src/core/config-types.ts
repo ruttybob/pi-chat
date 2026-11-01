@@ -20,6 +20,8 @@ export interface GondolinMountConfig {
 	guestPath?: string;
 	/** Default true — the VM cannot write to the host folder. */
 	readOnly?: boolean;
+	/** hostPath is a channel-owned git worktree copy (never removed automatically; ADR 0002). */
+	worktree?: boolean;
 }
 
 export interface GondolinConfig {
