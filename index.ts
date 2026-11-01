@@ -852,6 +852,15 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 			runtime.armAfterCurrentTail();
+			// Q25: surface the remote-control commands in Telegram's UI (best effort).
+			void callTelegramApi((conversation.account as TelegramAccountConfig).botToken, "setMyCommands", {
+				commands: [
+					{ command: "new", description: "Start a new session" },
+					{ command: "compact", description: "Compact the session context" },
+					{ command: "status", description: "Show status" },
+					{ command: "stop", description: "Stop the current turn" },
+				],
+			}).catch(() => undefined);
 			logTailInterval = setInterval(() => {
 				void (async () => {
 					if (!runtime) return;
