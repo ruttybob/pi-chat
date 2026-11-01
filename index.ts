@@ -1519,7 +1519,10 @@ export default function (pi: ExtensionAPI) {
 					if (conversationId) sm.appendCustomEntry(SESSION_STATE_CUSTOM_TYPE, { conversationId });
 				},
 			});
-			if (!result.cancelled) return;
+			if (result.cancelled) return;
+			// Module state can survive the session switch: drop the mounts-reminder signature so
+			// the fresh session gets a reminder instead of being silenced by the old signature.
+			lastMountsReminderSignature = undefined;
 		},
 	});
 
@@ -1577,6 +1580,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		await loadConfigOnce();
 		ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
+		// A new (or resumed) session must not inherit the previous session's mounts-reminder
+		// signature; injectMountsReminder re-derives it from this session's entries.
+		lastMountsReminderSignature = undefined;
 		// Chat tools appear only while a conversation is connected.
 		setChatToolsActive(false);
 		updateStatus(ctx);
