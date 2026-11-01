@@ -21,10 +21,29 @@ const FULL_SESSION = [
 	"bg",
 	"subagent",
 	"codemode",
+	"update_plan",
+	"obs_recall",
 	"mcp__brave_search__web_search",
 	"mcp__zread__search",
 	...CHAT_TOOLS,
 ];
+
+describe("SoL-Pi context tools", () => {
+	it("stay in the conversation-bound surface when installed, vanish when absent", () => {
+		const withSolPi = conversationBoundSessionTools(["read", "bash", "codemode", "update_plan", "obs_recall", "bg"]);
+		assert.ok(withSolPi.includes("update_plan"));
+		assert.ok(withSolPi.includes("obs_recall"));
+		assert.ok(!withSolPi.includes("bg"));
+		const withoutSolPi = conversationBoundSessionTools(["read", "bash", "codemode", "bg"]);
+		assert.ok(!withoutSolPi.includes("update_plan"));
+		assert.ok(!withoutSolPi.includes("obs_recall"));
+	});
+
+	it("are allowed in remote turns too", () => {
+		assert.ok(REMOTE_TURN_TOOLS.includes("update_plan"));
+		assert.ok(REMOTE_TURN_TOOLS.includes("obs_recall"));
+	});
+});
 
 describe("REMOTE_TURN_TOOLS", () => {
 	it("is the conversation-bound surface minus chat_workers, exactly what the hook allows", () => {
@@ -34,7 +53,18 @@ describe("REMOTE_TURN_TOOLS", () => {
 		);
 		assert.deepEqual(
 			[...REMOTE_TURN_TOOLS].sort(),
-			["bash", "chat_attach", "chat_history", "chat_request_secret", "codemode", "edit", "read", "write"].sort(),
+			[
+				"bash",
+				"chat_attach",
+				"chat_history",
+				"chat_request_secret",
+				"codemode",
+				"edit",
+				"obs_recall",
+				"read",
+				"update_plan",
+				"write",
+			].sort(),
 		);
 	});
 });
@@ -52,6 +82,8 @@ describe("restoreUnconnectedTools", () => {
 			"bash",
 			"bg",
 			"codemode",
+			"update_plan",
+			"obs_recall",
 			"mcp__brave_search__web_search",
 			"subagent",
 		]);

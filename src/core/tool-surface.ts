@@ -1,10 +1,14 @@
 // Direct chat tools: declared to the model only while a conversation is connected.
 export const CHAT_TOOLS = ["chat_history", "chat_attach", "chat_workers", "chat_request_secret"];
 
+// SoL-Pi context tools: only present in knownTools when the SoL-Pi package is installed.
+// They help the model manage its own context and are safe in connected sessions (ADR 0001).
+export const CONTEXT_TOOLS = ["update_plan", "obs_recall"];
+
 // Canonical allowed set for conversation-bound sessions (ADR 0001): VM delegates,
-// chat tools and codemode. Host tools (bg, subagent, host MCP) are dropped; the
-// tool_call hook keeps a defense-in-depth whitelist for remote turns.
-export const CONVERSATION_BOUND_TOOLS = ["read", "write", "edit", "bash", ...CHAT_TOOLS, "codemode"];
+// chat tools, codemode and SoL-Pi context tools. Host tools (bg, subagent, host MCP)
+// are dropped; the tool_call hook keeps a defense-in-depth whitelist for remote turns.
+export const CONVERSATION_BOUND_TOOLS = ["read", "write", "edit", "bash", ...CHAT_TOOLS, "codemode", ...CONTEXT_TOOLS];
 
 // Remote turns (job-queue dispatch) run without a human watching: same surface minus
 // chat_workers (a host worker overview makes no sense mid-turn). This is the single
