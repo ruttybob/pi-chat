@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -135,6 +136,23 @@ export function sanitizeRemoteMcp(accountId: string, remoteMcp: unknown): Record
 	return Object.keys(result).length > 0 ? result : undefined;
 }
 
+// ADR 0001 (Q23): the per-account remoteMcp allowlist lives in <shared>/mcp.json, not in
+// config.json — re-read every remote turn so edits apply live, without /chat-connect.
+export function readAccountRemoteMcp(accountId: string, sharedDir: string): Record<string, string[]> | undefined {
+	let raw: string;
+	try {
+		raw = readFileSync(join(sharedDir, "mcp.json"), "utf8");
+	} catch {
+		return undefined;
+	}
+	try {
+		return sanitizeRemoteMcp(accountId, JSON.parse(raw));
+	} catch {
+		console.warn(`[pi-chat] ${sharedDir}/mcp.json is not valid JSON — remote MCP is unavailable until fixed`);
+		return undefined;
+	}
+}
+
 export async function saveChatConfig(config: ChatConfig): Promise<void> {
 	await ensureChatHome();
 	await writeFile(CHAT_CONFIG_PATH, `${JSON.stringify(config, null, "\t")}\n`, "utf8");
@@ -153,7 +171,19 @@ export async function loadChatConfig(): Promise<ChatConfig> {
 				);
 				continue;
 			}
-			account.remoteMcp = sanitizeRemoteMcp(key, account.remoteMcp);
+			// One-time migration: the pre-file remoteMcp field moves to shared/mcp.json (Q23).
+			const legacy = (account as { remoteMcp?: unknown }).remoteMcp;
+			if (legacy !== undefined) {
+				delete (account as { remoteMcp?: unknown }).remoteMcp;
+				const sharedDir = join(getAccountStorageDir(key), "shared");
+				if (!existsSync(join(sharedDir, "mcp.json"))) {
+					const sanitized = sanitizeRemoteMcp(key, legacy);
+					if (sanitized) {
+						await mkdir(sharedDir, { recursive: true });
+						await writeFile(join(sharedDir, "mcp.json"), `${JSON.stringify(sanitized, null, "\t")}\n`);
+					}
+				}
+			}
 			accounts[key] = account;
 		}
 		return {

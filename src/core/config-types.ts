@@ -46,8 +46,6 @@ export interface BaseAccountConfig {
 	name?: string;
 	access?: AccessPolicy;
 	gondolin?: GondolinConfig;
-	/** MCP server name → explicit tool names allowed in connected sessions (ADR 0001); unset/empty denies all MCP. */
-	remoteMcp?: Record<string, string[]>;
 	channels: Record<string, ConfiguredChannel>;
 }
 

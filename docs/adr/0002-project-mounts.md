@@ -12,7 +12,7 @@ status: accepted
 
 ## Живые изменения конфигурации
 
-Межпроцессного IPC нет. Изменение маунтов применяется: (а) в том же процессе — сразу, перезапуском sandbox (`applyAndRestart`); (б) в живом detached-воркере — только после его перезапуска (`/chat-spawn-all --restart`), поэтому `/chat-project-mount` предупреждает о живом воркере. Allowlist remoteMcp воркер перечитывает из конфига в начале каждого remote-хода (ADR 0001), перезапуск для него не нужен.
+Межпроцессного IPC нет. Изменение маунтов применяется: (а) в том же процессе — сразу, перезапуском sandbox (`applyAndRestart`); (б) в живом detached-воркере — только после его перезапуска (`/chat-spawn-all --restart`), поэтому `/chat-project-mount` предупреждает о живом воркере. Allowlist remoteMcp воркер перечитывает из `accounts/<account>/shared/mcp.json` в начале каждого remote-хода (ADR 0001), перезапуск для него не нужен.
 
 ## Consequences
 

@@ -24,6 +24,7 @@ import {
 	ensureChatHome,
 	listConfiguredConversations,
 	loadChatConfig,
+	readAccountRemoteMcp,
 	resolveConversation,
 	saveChatConfig,
 } from "./src/config.js";
@@ -622,7 +623,9 @@ export default function (pi: ExtensionAPI) {
 	function setChatToolsActive(chatConnected: boolean): void {
 		if (chatConnected) {
 			unconnectedActiveTools = pi.getActiveTools();
-			connectedRemoteMcp = runtime?.conversation.account.remoteMcp;
+			connectedRemoteMcp = runtime
+				? readAccountRemoteMcp(runtime.conversation.accountId, runtime.conversation.sharedDir)
+				: undefined;
 			applyConnectedTools();
 			return;
 		}
@@ -1187,17 +1190,13 @@ export default function (pi: ExtensionAPI) {
 		}
 		try {
 			chatTurnInFlight = true;
-			// ADR 0001: remoteMcp allowlist edits must reach detached workers too — there is no
-			// IPC, so each remote turn starts by re-reading the config. A stale allowlist on a
-			// config read failure is acceptable: the in-memory set still applies.
-			try {
-				const fresh = resolveConversation(await loadChatConfig(), runtime.conversation.conversationId);
-				if (fresh && JSON.stringify(fresh.account.remoteMcp ?? null) !== JSON.stringify(connectedRemoteMcp ?? null)) {
-					connectedRemoteMcp = fresh.account.remoteMcp;
-					applyConnectedTools();
-				}
-			} catch {
-				// keep the in-memory allowlist
+			// ADR 0001 (Q23): the allowlist lives in shared/mcp.json; each remote turn re-reads
+			// the file so edits reach detached workers without IPC or /chat-connect. A stale
+			// allowlist on a read failure is acceptable: the in-memory set still applies.
+			const freshMcp = readAccountRemoteMcp(runtime.conversation.accountId, runtime.conversation.sharedDir);
+			if (JSON.stringify(freshMcp ?? null) !== JSON.stringify(connectedRemoteMcp ?? null)) {
+				connectedRemoteMcp = freshMcp;
+				applyConnectedTools();
 			}
 			activeTriggerMessageId = next.triggerMessageId;
 			queuedOutboundAttachments = [];
@@ -1288,13 +1287,14 @@ export default function (pi: ExtensionAPI) {
 			const updatedConfig = await loadChatConfig();
 			const updatedConversation = resolveConversation(updatedConfig, conversationId);
 			if (!updatedConversation) return;
-			// remoteMcp edits take effect without reconnecting (ADR 0001: one rule for the session).
-			if (
-				runtime &&
-				JSON.stringify(updatedConversation.account.remoteMcp ?? null) !== JSON.stringify(connectedRemoteMcp ?? null)
-			) {
-				connectedRemoteMcp = updatedConversation.account.remoteMcp;
-				applyConnectedTools();
+			// remoteMcp now lives in shared/mcp.json and is re-read per remote turn (Q23);
+			// sync right away so interactive turns see file edits without reconnecting.
+			if (runtime) {
+				const freshMcp = readAccountRemoteMcp(runtime.conversation.accountId, runtime.conversation.sharedDir);
+				if (JSON.stringify(freshMcp ?? null) !== JSON.stringify(connectedRemoteMcp ?? null)) {
+					connectedRemoteMcp = freshMcp;
+					applyConnectedTools();
+				}
 			}
 			const afterSecrets = stableSecretsKey(updatedConversation.gondolinSecrets);
 			if (beforeSecrets === afterSecrets) return;
