@@ -99,6 +99,42 @@ export async function removeChannelStorage(accountId: string, channelKey: string
 	await rm(getChannelStorageDir(accountId, channelKey), { recursive: true, force: true });
 }
 
+// pi server names are [A-Za-z0-9_-]+ (a "*" can never be one); remoteMcp is an explicit
+// per-tool allowlist — wildcards would silently expose future tools (ADR 0001).
+const MCP_SERVER_NAME = /^[A-Za-z0-9_-]+$/;
+
+export function sanitizeRemoteMcp(accountId: string, remoteMcp: unknown): Record<string, string[]> | undefined {
+	if (remoteMcp === undefined) return undefined;
+	if (typeof remoteMcp !== "object" || remoteMcp === null || Array.isArray(remoteMcp)) {
+		console.warn(`[pi-chat] dropping remoteMcp of account "${accountId}" (expected server → tool names)`);
+		return undefined;
+	}
+	const result: Record<string, string[]> = {};
+	for (const [server, tools] of Object.entries(remoteMcp)) {
+		if (!MCP_SERVER_NAME.test(server)) {
+			console.warn(`[pi-chat] dropping remoteMcp server "${server}" of account "${accountId}" (invalid server name)`);
+			continue;
+		}
+		if (!Array.isArray(tools) || tools.some((tool) => typeof tool !== "string")) {
+			console.warn(
+				`[pi-chat] dropping remoteMcp server "${server}" of account "${accountId}" (expected a list of tool names)`,
+			);
+			continue;
+		}
+		const names = tools.filter((tool) => {
+			if (tool.includes("*")) {
+				console.warn(
+					`[pi-chat] dropping remoteMcp tool "${server}:${tool}" of account "${accountId}" (wildcards are not supported)`,
+				);
+				return false;
+			}
+			return true;
+		});
+		if (names.length > 0) result[server] = names;
+	}
+	return Object.keys(result).length > 0 ? result : undefined;
+}
+
 export async function saveChatConfig(config: ChatConfig): Promise<void> {
 	await ensureChatHome();
 	await writeFile(CHAT_CONFIG_PATH, `${JSON.stringify(config, null, "\t")}\n`, "utf8");
@@ -117,6 +153,7 @@ export async function loadChatConfig(): Promise<ChatConfig> {
 				);
 				continue;
 			}
+			account.remoteMcp = sanitizeRemoteMcp(key, account.remoteMcp);
 			accounts[key] = account;
 		}
 		return {
