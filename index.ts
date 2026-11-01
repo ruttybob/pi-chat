@@ -30,7 +30,12 @@ import {
 import type { ResolvedConversation, TelegramAccountConfig } from "./src/core/config-types.js";
 import { ensureUniqueKey, makeChannelKey } from "./src/core/keys.js";
 import type { InboundMessageInput } from "./src/core/runtime-types.js";
-import { CHAT_TOOLS, conversationBoundSessionTools } from "./src/core/tool-surface.js";
+import {
+	CHAT_TOOLS,
+	conversationBoundSessionTools,
+	isMcpToolName,
+	remoteMcpAllowedTools,
+} from "./src/core/tool-surface.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
 import { type AccountFeed, startAccountFeed } from "./src/live/feed.js";
 import { connectLive } from "./src/live/index.js";
@@ -358,6 +363,8 @@ export default function (pi: ExtensionAPI) {
 	let sandbox: ConversationSandbox | undefined;
 	let ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
 	let chatTurnInFlight = false;
+	// remoteMcp allowlist of the currently connected session's account (ADR 0001, ticket #3).
+	let connectedRemoteMcp: Record<string, string[]> | undefined;
 	let configLoadedAtLeastOnce = false;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let workerStatusInterval: ReturnType<typeof setInterval> | undefined;
@@ -572,12 +579,23 @@ export default function (pi: ExtensionAPI) {
 	// disconnect restores the pre-connect set. Remote turns stay guarded by the
 	// tool_call hook below. With codemode.mode = "only" the model reaches the file
 	// tools through codemode scripts instead of declarations.
+	function applyConnectedTools(): void {
+		pi.setActiveTools(
+			conversationBoundSessionTools(
+				pi.getAllTools().map((tool) => tool.name),
+				remoteMcpAllowedTools(connectedRemoteMcp),
+			),
+		);
+	}
+
 	function setChatToolsActive(chatConnected: boolean): void {
 		if (chatConnected) {
 			unconnectedActiveTools = pi.getActiveTools();
-			pi.setActiveTools(conversationBoundSessionTools(pi.getAllTools().map((tool) => tool.name)));
+			connectedRemoteMcp = runtime?.conversation.account.remoteMcp;
+			applyConnectedTools();
 			return;
 		}
+		connectedRemoteMcp = undefined;
 		const restored = unconnectedActiveTools ?? pi.getActiveTools();
 		unconnectedActiveTools = undefined;
 		pi.setActiveTools(restored.filter((name) => !CHAT_TOOLS.includes(name)));
@@ -1177,6 +1195,17 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("tool_call", async (event) => {
+		if (!runtime) return;
+		// remoteMcp allowlist (ADR 0001): one rule for the whole connected session — interactive
+		// and remote turns alike; the hook also fires for nested codemode calls, which is the
+		// only barrier for codemode/deferred MCP tools.
+		const allowedMcp = remoteMcpAllowedTools(connectedRemoteMcp);
+		if (isMcpToolName(event.toolName) && !allowedMcp.has(event.toolName)) {
+			return {
+				block: true,
+				reason: `MCP tool "${event.toolName}" is not in this account's remoteMcp allowlist (config.json)`,
+			};
+		}
 		if (!chatTurnInFlight) return;
 		// "codemode" is how the model reaches the file tools (see codemode.mode = "only").
 		const remoteAllowed = [
@@ -1189,10 +1218,11 @@ export default function (pi: ExtensionAPI) {
 			"chat_history",
 			"chat_request_secret",
 		];
-		if (!remoteAllowed.includes(event.toolName)) {
+		if (!remoteAllowed.includes(event.toolName) && !allowedMcp.has(event.toolName)) {
 			return {
 				block: true,
-				reason: "pi-chat remote turns only allow read, write, edit, bash, chat_history, and chat_attach",
+				reason:
+					"pi-chat remote turns only allow read, write, edit, bash, chat_history, chat_attach, and allowlisted MCP tools",
 			};
 		}
 		const configuredTools = runtime?.conversation.channel.tools;
@@ -1216,6 +1246,14 @@ export default function (pi: ExtensionAPI) {
 			const updatedConfig = await loadChatConfig();
 			const updatedConversation = resolveConversation(updatedConfig, conversationId);
 			if (!updatedConversation) return;
+			// remoteMcp edits take effect without reconnecting (ADR 0001: one rule for the session).
+			if (
+				runtime &&
+				JSON.stringify(updatedConversation.account.remoteMcp ?? null) !== JSON.stringify(connectedRemoteMcp ?? null)
+			) {
+				connectedRemoteMcp = updatedConversation.account.remoteMcp;
+				applyConnectedTools();
+			}
 			const afterSecrets = stableSecretsKey(updatedConversation.gondolinSecrets);
 			if (beforeSecrets === afterSecrets) return;
 			const confirm = await ctx.ui.confirm(
