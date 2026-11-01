@@ -7,7 +7,7 @@
 		"lineWidth": 120
 	},
 	"files": {
-		"includes": ["**", "!.pi"]
+		"includes": ["**", "!.pi", "!.groma"]
 	},
 	"linter": {
 		"enabled": true,
