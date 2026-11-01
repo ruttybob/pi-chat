@@ -1,8 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { type Dirent, constants as fsConstants } from "node:fs";
-import { lstat, mkdir, open, readdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { basename, extname, isAbsolute, join, relative } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { ensureGuestAssets, hasGuestAssets } from "@earendil-works/gondolin";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
@@ -40,6 +39,7 @@ import type { LiveConnection } from "./src/live/types.js";
 import { appendRemoteError, appendRemoteInbound } from "./src/log.js";
 import { ConversationRuntime } from "./src/runtime.js";
 import { createSecretRequest, tryDecryptSecret } from "./src/secrets.js";
+import { type ChatPromptSkill, loadSafeChatSkills, safeReadMountedText } from "./src/skills.js";
 import { runChatConfigUI } from "./src/tui/chat-config.js";
 import { runWithLoader, selectItem, showNotice } from "./src/tui/dialogs.js";
 
@@ -72,8 +72,8 @@ System configuration:
 
 Skills:
 - You can create reusable tools as skills.
-- Account-wide skills go in /shared/skills/, channel-specific in /workspace/skills/.
-- A skill is either a single .md file (e.g. skills/foo.md) or a directory with a SKILL.md plus any supporting files like scripts, configs, or data (e.g. skills/foo/SKILL.md, skills/foo/run.sh).
+- Skills live in /shared/.pi/skills/ and are shared across all channels of the account.
+- A skill is either a single .md file (e.g. .pi/skills/foo.md) or a directory with a SKILL.md plus any supporting files like scripts, configs, or data (e.g. .pi/skills/foo/SKILL.md, .pi/skills/foo/run.sh).
 - Each skill needs YAML frontmatter:
   ---
   name: skill-name
@@ -125,17 +125,6 @@ interface WorkerStatusSnapshot {
 	lastError?: string;
 }
 
-interface ChatPromptSkill {
-	name: string;
-	description: string;
-	filePath: string;
-}
-
-function isInsideHostPath(root: string, value: string): boolean {
-	const rel = relative(root, value);
-	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
 function escapeXml(value: string): string {
 	return value
 		.replace(/&/g, "&amp;")
@@ -143,85 +132,6 @@ function escapeXml(value: string): string {
 		.replace(/>/g, "&gt;")
 		.replace(/"/g, "&quot;")
 		.replace(/'/g, "&apos;");
-}
-
-async function safeReadMountedText(root: string, filePath: string): Promise<string> {
-	try {
-		const realRoot = await realpath(root);
-		const resolvedPath = await realpath(filePath);
-		if (!isInsideHostPath(realRoot, resolvedPath)) return "";
-		const handle = await open(resolvedPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-		try {
-			const info = await handle.stat();
-			if (!info.isFile()) return "";
-			return await handle.readFile("utf8");
-		} finally {
-			await handle.close();
-		}
-	} catch {
-		return "";
-	}
-}
-
-function parseSkillFrontmatter(content: string): { name?: string; description?: string; disabled?: boolean } {
-	const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-	if (!match) return {};
-	const frontmatter: { name?: string; description?: string; disabled?: boolean } = {};
-	for (const line of match[1].split(/\r?\n/)) {
-		const separator = line.indexOf(":");
-		if (separator <= 0) continue;
-		const key = line.slice(0, separator).trim();
-		const rawValue = line
-			.slice(separator + 1)
-			.trim()
-			.replace(/^['"]|['"]$/g, "");
-		if (key === "name") frontmatter.name = rawValue;
-		if (key === "description") frontmatter.description = rawValue;
-		if (key === "disable-model-invocation") frontmatter.disabled = rawValue === "true";
-	}
-	return frontmatter;
-}
-
-async function loadSafeChatSkills(root: string): Promise<ChatPromptSkill[]> {
-	const skillsRoot = join(root, "skills");
-	const skills: ChatPromptSkill[] = [];
-	async function addSkill(filePath: string, defaultName: string): Promise<void> {
-		const content = await safeReadMountedText(root, filePath);
-		const frontmatter = parseSkillFrontmatter(content);
-		if (!frontmatter.description?.trim() || frontmatter.disabled) return;
-		skills.push({ name: frontmatter.name || defaultName, description: frontmatter.description, filePath });
-	}
-	async function walkSkills(dir: string, depth: number): Promise<void> {
-		if (depth > 8) return;
-		let entries: Dirent<string>[];
-		try {
-			entries = await readdir(dir, { withFileTypes: true });
-		} catch {
-			return;
-		}
-		for (const entry of entries) {
-			if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.isSymbolicLink()) continue;
-			const fullPath = join(dir, entry.name);
-			if (entry.isFile() && extname(entry.name).toLowerCase() === ".md") {
-				await addSkill(fullPath, basename(entry.name, ".md"));
-				continue;
-			}
-			if (!entry.isDirectory()) continue;
-			const skillMd = join(fullPath, "SKILL.md");
-			try {
-				const info = await lstat(skillMd);
-				if (info.isFile()) {
-					await addSkill(skillMd, entry.name);
-					continue;
-				}
-			} catch {
-				// Not a skill root; recurse below.
-			}
-			await walkSkills(fullPath, depth + 1);
-		}
-	}
-	await walkSkills(skillsRoot, 0);
-	return skills;
 }
 
 function formatChatSkillsForPrompt(skills: ChatPromptSkill[]): string {
@@ -555,13 +465,10 @@ export default function (pi: ExtensionAPI) {
 
 	async function buildSkillsPromptSuffix(): Promise<string> {
 		if (!runtime) return "";
-		const sharedSkills = await loadSafeChatSkills(runtime.conversation.sharedDir);
-		const channelSkills = await loadSafeChatSkills(runtime.conversation.workspaceDir);
-		const skillMap = new Map<string, ChatPromptSkill>();
-		for (const skill of sharedSkills) skillMap.set(skill.name, skill);
-		for (const skill of channelSkills) skillMap.set(skill.name, skill);
-		const allSkills = [...skillMap.values()].map((skill) => ({ ...skill, filePath: hostToGuestPath(skill.filePath) }));
-		const formatted = formatChatSkillsForPrompt(allSkills);
+		const skills = await loadSafeChatSkills(runtime.conversation.sharedDir);
+		const formatted = formatChatSkillsForPrompt(
+			skills.map((skill) => ({ ...skill, filePath: hostToGuestPath(skill.filePath) })),
+		);
 		return formatted ? `\n\nAvailable skills:\n${formatted}` : "";
 	}
 
