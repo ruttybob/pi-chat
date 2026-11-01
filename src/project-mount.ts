@@ -3,8 +3,9 @@ import { basename } from "node:path";
 
 import type { GondolinMountConfig } from "./core/config-types.js";
 
-// ADR 0002: the project mount always appears at this guest path.
-export const PROJECT_MOUNT_GUEST_PATH = "/workspace/project";
+// ADR 0002: every project mounts at /workspace/<slug>; the slug distinguishes projects,
+// so one workspace can hold several mounts at once. Remounting the same project
+// (ro ↔ rw) keeps the slug — derived from the repo root for git, else from the path.
 
 // customType of the persistent mounts reminder message.
 export const MOUNTS_REMINDER_CUSTOM_TYPE = "chat-mounts";
@@ -42,8 +43,12 @@ function shortHash(value: string): string {
 	return hash.toString(16).padStart(8, "0");
 }
 
+export function projectMountGuestPath(hostPath: string, repoRoot?: string): string {
+	return `/workspace/${deriveWorktreeSlug(hostPath, repoRoot ?? hostPath)}`;
+}
+
 // Stable per repo root, so unmount/remount of the same project reuses its worktree.
-export function deriveWorktreeSlug(hostPath: string, repoRoot: string): string {
+export function deriveWorktreeSlug(hostPath: string, repoRoot = hostPath): string {
 	const stem =
 		basename(hostPath)
 			.toLowerCase()
@@ -53,11 +58,16 @@ export function deriveWorktreeSlug(hostPath: string, repoRoot: string): string {
 }
 
 export function upsertProjectMount(mounts: GondolinMountConfig[], entry: GondolinMountConfig): GondolinMountConfig[] {
-	return [...mounts.filter((mount) => mount.guestPath !== PROJECT_MOUNT_GUEST_PATH), entry];
+	const idx = mounts.findIndex((mount) => mount.guestPath === entry.guestPath);
+	if (idx === -1) return [...mounts, entry];
+	return mounts.map((mount, i) => (i === idx ? entry : mount));
 }
 
-export function removeProjectMount(mounts: GondolinMountConfig[]): GondolinMountConfig[] {
-	return mounts.filter((mount) => mount.guestPath !== PROJECT_MOUNT_GUEST_PATH);
+// Unmount matches host paths: a ro mount binds the original folder, an rw mount the
+// worktree copy — callers pass the candidate paths derived from the user's argument.
+export function removeProjectMount(mounts: GondolinMountConfig[], hostPaths: string[]): GondolinMountConfig[] {
+	const drop = new Set(hostPaths);
+	return mounts.filter((mount) => !drop.has(mount.hostPath));
 }
 
 export function mountsSignature(mounts: GondolinMountConfig[]): string {

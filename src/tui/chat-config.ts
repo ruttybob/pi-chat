@@ -4,7 +4,6 @@ import {
 	loadChatConfig,
 	removeAccountStorage,
 	removeChannelStorage,
-	sanitizeRemoteMcp,
 	saveChatConfig,
 } from "../config.js";
 import type {
@@ -16,7 +15,6 @@ import type {
 	TelegramAccountConfig,
 } from "../core/config-types.js";
 import type { DiscoveredUser, DiscoverySnapshot } from "../core/discovery-types.js";
-import type { RemoteMcpAllowlist } from "../core/tool-surface.js";
 import { loadDiscoverySnapshot } from "../discovery-store.js";
 import { refreshAccountSnapshot, updateAccountIdentityFromSnapshot } from "../services/index.js";
 import { selectItem, showNotice, toggleItems } from "./dialogs.js";

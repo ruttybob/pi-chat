@@ -52,7 +52,7 @@ import {
 	formatMountsReminder,
 	MOUNTS_REMINDER_CUSTOM_TYPE,
 	mountsSignature,
-	PROJECT_MOUNT_GUEST_PATH,
+	projectMountGuestPath,
 	removeProjectMount,
 	upsertProjectMount,
 } from "./src/project-mount.js";
@@ -1387,14 +1387,41 @@ export default function (pi: ExtensionAPI) {
 			};
 			if (mode === "unmount") {
 				const mounts = channel.gondolin?.mounts ?? [];
-				if (!mounts.some((mount) => mount.guestPath === PROJECT_MOUNT_GUEST_PATH)) {
-					ctx.ui.notify("No project mount to unmount.", "info");
+				if (mounts.length === 0) {
+					ctx.ui.notify("No project mounts.", "info");
 					return;
 				}
-				channel.gondolin = { ...channel.gondolin, mounts: removeProjectMount(mounts) };
+				// With an argument, match by host path (original for ro, worktree copy for rw);
+				// without one, unmount the single mount or list what to choose from.
+				const candidates = new Set<string>();
+				if (rawPath) {
+					let resolved = rawPath;
+					try {
+						resolved = await realpath(rawPath);
+					} catch {
+						// not an existing path — still try the literal
+					}
+					candidates.add(resolved);
+					const slug = deriveWorktreeSlug(resolved);
+					candidates.add(join(conversation.conversationDir, "worktrees", slug));
+				} else if (mounts.length === 1) {
+					candidates.add(mounts[0].hostPath);
+				} else {
+					ctx.ui.notify(
+						`Multiple project mounts — specify which one: ${mounts.map((m) => m.hostPath).join(", ")}`,
+						"warning",
+					);
+					return;
+				}
+				const removed = mounts.filter((mount) => candidates.has(mount.hostPath));
+				if (removed.length === 0) {
+					ctx.ui.notify(`No project mount for ${rawPath}.`, "info");
+					return;
+				}
+				channel.gondolin = { ...channel.gondolin, mounts: removeProjectMount(mounts, [...candidates]) };
 				await saveChatConfig(config);
 				// ADR 0002: worktrees are never removed automatically — uncommitted edits may live there.
-				ctx.ui.notify(`Unmounted ${PROJECT_MOUNT_GUEST_PATH}. Any worktree copy was kept.`, "info");
+				ctx.ui.notify(`Unmounted ${removed.map((m) => m.guestPath).join(", ")}. Any worktree copy was kept.`, "info");
 				await applyAndRestart();
 				await injectMountsReminder(ctx, true);
 				notifyWorkerRestartNeeded(ctx, conversation.conversationId);
@@ -1413,7 +1440,7 @@ export default function (pi: ExtensionAPI) {
 			const repoRoot = probe.status === 0 ? probe.stdout.trim() : undefined;
 			let entry: GondolinMountConfig;
 			if (mode === "ro" || !repoRoot) {
-				entry = { hostPath, guestPath: PROJECT_MOUNT_GUEST_PATH, readOnly: mode === "ro" };
+				entry = { hostPath, guestPath: projectMountGuestPath(hostPath, repoRoot), readOnly: mode === "ro" };
 			} else {
 				const slug = deriveWorktreeSlug(hostPath, repoRoot);
 				const worktreePath = join(conversation.conversationDir, "worktrees", slug);
@@ -1437,12 +1464,17 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 				}
-				entry = { hostPath: worktreePath, guestPath: PROJECT_MOUNT_GUEST_PATH, readOnly: false, worktree: true };
+				entry = {
+					hostPath: worktreePath,
+					guestPath: projectMountGuestPath(hostPath, repoRoot),
+					readOnly: false,
+					worktree: true,
+				};
 			}
 			channel.gondolin = { ...channel.gondolin, mounts: upsertProjectMount(channel.gondolin?.mounts ?? [], entry) };
 			await saveChatConfig(config);
 			ctx.ui.notify(
-				`Mounted ${hostPath} at ${PROJECT_MOUNT_GUEST_PATH} (${mode === "rw" && entry.worktree ? "rw, worktree copy" : mode}).`,
+				`Mounted ${hostPath} at ${entry.guestPath} (${mode === "rw" && entry.worktree ? "rw, worktree copy" : mode}).`,
 				"info",
 			);
 			await applyAndRestart();

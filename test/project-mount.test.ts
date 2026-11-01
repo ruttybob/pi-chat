@@ -11,13 +11,20 @@ import {
 	formatMountsReminder,
 	type GondolinMountConfig,
 	mountsSignature,
-	PROJECT_MOUNT_GUEST_PATH,
+	projectMountGuestPath,
 	removeProjectMount,
 	upsertProjectMount,
 } from "../src/project-mount.ts";
 
-test("project mount uses the fixed guest path (ADR 0002)", () => {
-	assert.equal(PROJECT_MOUNT_GUEST_PATH, "/workspace/project");
+test("guest paths are /workspace/<slug> and distinct per project (ADR 0002)", () => {
+	// A git repo mounts under its repo-root slug — the same slug whether mounted ro or rw.
+	const repo = projectMountGuestPath("/Users/me/My App", "/Users/me/My App");
+	assert.equal(repo, `/workspace/${deriveWorktreeSlug("/Users/me/My App", "/Users/me/My App")}`);
+	assert.match(repo, /^\/workspace\/[a-z0-9][a-z0-9-]*$/);
+	// Non-git folders hash their own path.
+	const plain = projectMountGuestPath("/data/site");
+	assert.equal(plain, `/workspace/${deriveWorktreeSlug("/data/site", "/data/site")}`);
+	assert.notEqual(repo, projectMountGuestPath("/Users/other/My App", "/Users/other/My App"));
 });
 
 // Mounts reminders collapse in LLM context: a reminder is superseded by a newer
@@ -84,29 +91,50 @@ test("ensureWorktree recreates a manually deleted worktree by reusing its branch
 	assert.equal(branch.stdout.trim(), "proj-ab12cd34");
 });
 
-test("upsert replaces the project mount and keeps unrelated mounts", () => {
-	const unrelated: GondolinMountConfig = { hostPath: "/tmp/data", guestPath: "/workspace/data" };
-	const ro: GondolinMountConfig = { hostPath: "/repo", guestPath: PROJECT_MOUNT_GUEST_PATH, readOnly: true };
-	assert.deepEqual(upsertProjectMount([], ro), [ro]);
-	const replaced = upsertProjectMount([unrelated, ro], { ...ro, hostPath: "/repo2", readOnly: false });
-	assert.equal(replaced.length, 2);
-	assert.deepEqual(replaced[0], unrelated);
-	assert.deepEqual(replaced[1], { hostPath: "/repo2", guestPath: PROJECT_MOUNT_GUEST_PATH, readOnly: false });
+test("upsert keeps one mount per guest path: projects coexist, remounts replace", () => {
+	const data: GondolinMountConfig = { hostPath: "/tmp/data", guestPath: "/workspace/data" };
+	const repoRo: GondolinMountConfig = { hostPath: "/repo", guestPath: "/workspace/repo-aaaa", readOnly: true };
+	assert.deepEqual(upsertProjectMount([], repoRo), [repoRo]);
+	// A different project adds a second mount.
+	const site: GondolinMountConfig = { hostPath: "/site", guestPath: "/workspace/site-bbbb", readOnly: true };
+	assert.deepEqual(upsertProjectMount([data, repoRo], site), [data, repoRo, site]);
+	// Remounting the same guest path (ro → rw) replaces in place.
+	const replaced = upsertProjectMount([data, repoRo, site], {
+		hostPath: "/repo/.worktrees/repo-aaaa",
+		guestPath: "/workspace/repo-aaaa",
+		readOnly: false,
+		worktree: true,
+	});
+	assert.equal(replaced.length, 3);
+	assert.deepEqual(replaced[1], {
+		hostPath: "/repo/.worktrees/repo-aaaa",
+		guestPath: "/workspace/repo-aaaa",
+		readOnly: false,
+		worktree: true,
+	});
 });
 
-test("remove drops only the project mount and tolerates absence", () => {
-	const unrelated: GondolinMountConfig = { hostPath: "/tmp/data", guestPath: "/workspace/data" };
-	const ro: GondolinMountConfig = { hostPath: "/repo", guestPath: PROJECT_MOUNT_GUEST_PATH, readOnly: true };
-	assert.deepEqual(removeProjectMount([unrelated, ro]), [unrelated]);
-	assert.deepEqual(removeProjectMount([unrelated]), [unrelated]);
-	assert.deepEqual(removeProjectMount([]), []);
+test("remove drops mounts by host path and tolerates absence", () => {
+	const data: GondolinMountConfig = { hostPath: "/tmp/data", guestPath: "/workspace/data" };
+	const repoRo: GondolinMountConfig = { hostPath: "/repo", guestPath: "/workspace/repo-aaaa", readOnly: true };
+	const repoWt: GondolinMountConfig = {
+		hostPath: "/conv/worktrees/repo-aaaa",
+		guestPath: "/workspace/repo-aaaa",
+		readOnly: false,
+		worktree: true,
+	};
+	// ro unmount matches the original path; rw unmount matches the worktree copy path.
+	assert.deepEqual(removeProjectMount([data, repoRo], ["/repo"]), [data]);
+	assert.deepEqual(removeProjectMount([data, repoWt], ["/conv/worktrees/repo-aaaa"]), [data]);
+	assert.deepEqual(removeProjectMount([data, repoWt], ["/other"]), [data, repoWt]);
+	assert.deepEqual(removeProjectMount([], ["/repo"]), []);
 });
 
 test("signature matches identical mounts and differs on any change", () => {
-	const ro: GondolinMountConfig = { hostPath: "/repo", guestPath: PROJECT_MOUNT_GUEST_PATH, readOnly: true };
+	const ro: GondolinMountConfig = { hostPath: "/repo", guestPath: "/workspace/repo-aaaa", readOnly: true };
 	const rw: GondolinMountConfig = {
 		hostPath: "/repo2",
-		guestPath: PROJECT_MOUNT_GUEST_PATH,
+		guestPath: "/workspace/repo2-bbbb",
 		readOnly: false,
 		worktree: true,
 	};
@@ -117,15 +145,15 @@ test("signature matches identical mounts and differs on any change", () => {
 
 test("reminder shows VM path, RO/RW, host source, and the RW worktree instruction (ADR 0002)", () => {
 	assert.equal(formatMountsReminder([]), "");
-	const ro: GondolinMountConfig = { hostPath: "/repo", guestPath: PROJECT_MOUNT_GUEST_PATH, readOnly: true };
+	const ro: GondolinMountConfig = { hostPath: "/repo", guestPath: "/workspace/repo-aaaa", readOnly: true };
 	const roText = formatMountsReminder([ro]);
-	assert.match(roText, /\/workspace\/project/);
+	assert.match(roText, /\/workspace\/repo-aaaa/);
 	assert.match(roText, /\/repo/);
 	assert.match(roText, /read-only/);
 	assert.doesNotMatch(roText, /read-write/);
 	const rw: GondolinMountConfig = {
 		hostPath: "/repo2",
-		guestPath: PROJECT_MOUNT_GUEST_PATH,
+		guestPath: "/workspace/repo2-bbbb",
 		readOnly: false,
 		worktree: true,
 	};
@@ -139,4 +167,8 @@ test("reminder shows VM path, RO/RW, host source, and the RW worktree instructio
 	assert.match(directText, /read-write/);
 	assert.match(directText, /original folder/);
 	assert.doesNotMatch(directText, /worktree copy/);
+	// Several projects appear in one reminder.
+	const both = formatMountsReminder([ro, rw]);
+	assert.match(both, /\/workspace\/repo-aaaa/);
+	assert.match(both, /\/workspace\/repo2-bbbb/);
 });
