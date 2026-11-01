@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
 	deriveWorktreeSlug,
+	ensureWorktree,
 	formatMountsReminder,
 	type GondolinMountConfig,
 	mountsSignature,
@@ -19,6 +24,27 @@ test("worktree slug is sanitized, stable, and distinct per repo", () => {
 	assert.match(slug, /^[a-z0-9][a-z0-9-]*$/);
 	assert.equal(slug, deriveWorktreeSlug("/Users/me/My App", "/Users/me/My App"));
 	assert.notEqual(slug, deriveWorktreeSlug("/Users/other/My App", "/Users/other/My App"));
+});
+
+test("ensureWorktree recreates a manually deleted worktree by reusing its branch", () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-chat-wt-"));
+	const repo = join(root, "repo");
+	mkdirSync(repo, { recursive: true });
+	const run = (args: string[]) => spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+	run(["init", "-q"]);
+	writeFileSync(join(repo, "f.txt"), "x");
+	run(["add", "f.txt"]);
+	run(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+
+	const wt = join(root, "wt");
+	assert.deepEqual(ensureWorktree(repo, wt, "proj-ab12cd34"), { ok: true, reused: false });
+	assert.equal(existsSync(join(wt, "f.txt")), true);
+
+	// Manual delete: the branch survives, the worktree registration goes stale.
+	rmSync(wt, { recursive: true });
+	assert.deepEqual(ensureWorktree(repo, wt, "proj-ab12cd34"), { ok: true, reused: true });
+	const branch = spawnSync("git", ["-C", wt, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" });
+	assert.equal(branch.stdout.trim(), "proj-ab12cd34");
 });
 
 test("upsert replaces the project mount and keeps unrelated mounts", () => {

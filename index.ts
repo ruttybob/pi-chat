@@ -46,6 +46,7 @@ import type { LiveConnection } from "./src/live/types.js";
 import { appendRemoteError, appendRemoteInbound } from "./src/log.js";
 import {
 	deriveWorktreeSlug,
+	ensureWorktree,
 	formatMountsReminder,
 	mountsSignature,
 	PROJECT_MOUNT_GUEST_PATH,
@@ -1371,7 +1372,8 @@ export default function (pi: ExtensionAPI) {
 			if (mode === "ro" || !repoRoot) {
 				entry = { hostPath, guestPath: PROJECT_MOUNT_GUEST_PATH, readOnly: mode === "ro" };
 			} else {
-				const worktreePath = join(conversation.conversationDir, "worktrees", deriveWorktreeSlug(hostPath, repoRoot));
+				const slug = deriveWorktreeSlug(hostPath, repoRoot);
+				const worktreePath = join(conversation.conversationDir, "worktrees", slug);
 				if (existsSync(worktreePath)) {
 					// Reuse: the worktree may hold uncommitted edits; never recreate or delete it (ADR 0002).
 					const existing = spawnSync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], {
@@ -1386,9 +1388,9 @@ export default function (pi: ExtensionAPI) {
 					}
 				} else {
 					await mkdir(join(conversation.conversationDir, "worktrees"), { recursive: true });
-					const added = spawnSync("git", ["-C", repoRoot, "worktree", "add", worktreePath], { encoding: "utf8" });
-					if (added.status !== 0) {
-						ctx.ui.notify(`git worktree add failed: ${added.stderr.trim() || added.error?.message}`, "warning");
+					const ensured = ensureWorktree(repoRoot, worktreePath, slug);
+					if (!ensured.ok) {
+						ctx.ui.notify(`git worktree add failed: ${ensured.error}`, "warning");
 						return;
 					}
 				}

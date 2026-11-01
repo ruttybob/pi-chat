@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { basename } from "node:path";
 
 import type { GondolinMountConfig } from "./core/config-types.js";
@@ -49,4 +50,26 @@ export function formatMountsReminder(mounts: GondolinMountConfig[]): string {
 	});
 	if (lines.length === 0) return "";
 	return `Project mounts (host folders are reachable only through these VM paths):\n${lines.join("\n")}`;
+}
+
+export type EnsureWorktreeResult = { ok: true; reused: boolean } | { ok: false; error: string };
+
+// ADR 0002: the worktree copy lives under channels/<c>/worktrees/<slug>, and <slug> is
+// also its branch name. Re-creating after a manual directory delete must reuse the
+// existing branch (`git worktree add <path> <branch>`): naming a new branch (-b) fails
+// because the branch already exists.
+export function ensureWorktree(repoRoot: string, worktreePath: string, slug: string): EnsureWorktreeResult {
+	const git = (...args: string[]) => spawnSync("git", ["-C", repoRoot, ...args], { encoding: "utf8" });
+	if (git("rev-parse", "--verify", "--quiet", `refs/heads/${slug}`).status === 0) {
+		// The stale registration still points at the deleted path and blocks checkout.
+		git("worktree", "prune");
+		const added = git("worktree", "add", worktreePath, slug);
+		if (added.status !== 0)
+			return { ok: false, error: added.stderr.trim() || added.error?.message || "git worktree add failed" };
+		return { ok: true, reused: true };
+	}
+	const added = git("worktree", "add", "-b", slug, worktreePath);
+	if (added.status !== 0)
+		return { ok: false, error: added.stderr.trim() || added.error?.message || "git worktree add failed" };
+	return { ok: true, reused: false };
 }
