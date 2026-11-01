@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { ensureGuestAssets, hasGuestAssets } from "@earendil-works/gondolin";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
@@ -1290,9 +1290,13 @@ export default function (pi: ExtensionAPI) {
 			const conversationId = runtime.conversation.conversationId;
 			const config = await loadChatConfig();
 			const conversation = resolveConversation(config, conversationId);
-			const account = conversation && config.accounts[conversation.accountId];
+			if (!conversation) {
+				ctx.ui.notify("Connected conversation is no longer in the config.", "warning");
+				return;
+			}
+			const account = config.accounts[conversation.accountId];
 			const channel = account?.channels[conversation.channelKey];
-			if (!conversation || !account || !channel) {
+			if (!account || !channel) {
 				ctx.ui.notify("Connected conversation is no longer in the config.", "warning");
 				return;
 			}
