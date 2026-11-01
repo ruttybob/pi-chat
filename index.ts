@@ -1328,6 +1328,24 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("chat-project-mount", {
 		description: "Mount a host folder into the VM: /chat-project-mount [path] [ro|rw|unmount]",
+		getArgumentCompletions: (argumentText) => {
+			// getArgumentCompletions replaces the whole argument text, so a typed path must be echoed into each item value
+			const MODES = [
+				{ value: "ro", description: "read-only bind (default)" },
+				{ value: "rw", description: "writable worktree copy; source untouched" },
+				{ value: "unmount", description: "remove the mount (worktree kept)" },
+			] as const;
+			const tokens = argumentText.trim().split(/\s+/).filter(Boolean);
+			const last = tokens[tokens.length - 1] ?? "";
+			if (tokens.some((t) => MODES.some((m) => m.value === t))) return null;
+			if (!MODES.some((m) => m.value.startsWith(last))) return null;
+			const base = tokens.length > 1 ? tokens.slice(0, -1).join(" ") + " " : "";
+			return MODES.filter((m) => m.value.startsWith(last)).map((m) => ({
+				value: base + m.value,
+				label: base + m.value,
+				description: m.description,
+			}));
+		},
 		handler: async (args, ctx) => {
 			await loadConfigOnce();
 			if (!runtime) {
