@@ -32,11 +32,11 @@ import type { GondolinMountConfig, ResolvedConversation, TelegramAccountConfig }
 import { ensureUniqueKey, makeChannelKey } from "./src/core/keys.js";
 import type { InboundMessageInput } from "./src/core/runtime-types.js";
 import {
-	CHAT_TOOLS,
 	conversationBoundSessionTools,
 	isMcpToolName,
 	REMOTE_TURN_TOOLS,
 	remoteMcpAllowedTools,
+	restoreUnconnectedTools,
 } from "./src/core/tool-surface.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
 import { type AccountFeed, startAccountFeed } from "./src/live/feed.js";
@@ -625,9 +625,11 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		connectedRemoteMcp = undefined;
-		const restored = unconnectedActiveTools ?? pi.getActiveTools();
+		// Union of the pre-connect snapshot and the current set: tools enabled mid-session
+		// (e.g. MCP tools allowlisted after connect) survive the disconnect (ADR 0001).
+		const restored = restoreUnconnectedTools(unconnectedActiveTools ?? [], pi.getActiveTools());
 		unconnectedActiveTools = undefined;
-		pi.setActiveTools(restored.filter((name) => !CHAT_TOOLS.includes(name)));
+		pi.setActiveTools(restored);
 	}
 
 	async function registerTopicChannel(chatId: string, threadId: number, name: string): Promise<string | undefined> {

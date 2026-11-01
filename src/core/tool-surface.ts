@@ -11,6 +11,15 @@ export const CONVERSATION_BOUND_TOOLS = ["read", "write", "edit", "bash", ...CHA
 // source for the tool_call hook's remote whitelist.
 export const REMOTE_TURN_TOOLS = CONVERSATION_BOUND_TOOLS.filter((name) => name !== "chat_workers");
 
+// Disconnect restores the pre-connect snapshot but keeps anything enabled mid-session
+// (e.g. MCP tools added to the allowlist after connect); chat tools only make sense
+// while a conversation is connected and are always dropped.
+export function restoreUnconnectedTools(snapshot: string[], current: string[]): string[] {
+	const restored = [...snapshot];
+	for (const name of current) if (!restored.includes(name)) restored.push(name);
+	return restored.filter((name) => !CHAT_TOOLS.includes(name));
+}
+
 // pi names MCP server tools `mcp__<server>__<tool>` (everything but [A-Za-z0-9_] becomes
 // `_`) and registers resource tools that reach MCP servers too (mirrors pi's isMcpToolName).
 const MCP_RESOURCE_TOOLS = new Set(["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]);

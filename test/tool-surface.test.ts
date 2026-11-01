@@ -8,6 +8,7 @@ import {
 	mcpToolName,
 	REMOTE_TURN_TOOLS,
 	remoteMcpAllowedTools,
+	restoreUnconnectedTools,
 } from "../src/core/tool-surface.ts";
 
 // A realistic universe of tool names a pi session can have active: VM delegates reach
@@ -35,6 +36,29 @@ describe("REMOTE_TURN_TOOLS", () => {
 			[...REMOTE_TURN_TOOLS].sort(),
 			["bash", "chat_attach", "chat_history", "chat_request_secret", "codemode", "edit", "read", "write"].sort(),
 		);
+	});
+});
+
+describe("restoreUnconnectedTools", () => {
+	it("keeps pre-connect tools and mid-session enablements, drops chat tools", () => {
+		const snapshot = ["read", "write", "edit", "bash", "bg"];
+		const current = [...CONVERSATION_BOUND_TOOLS, "mcp__brave_search__web_search", "bg", "subagent"];
+		// codemode stays too: it is an ordinary session tool once disconnected (as are the
+		// file tools, which fall back to local implementations).
+		assert.deepEqual(restoreUnconnectedTools(snapshot, current), [
+			"read",
+			"write",
+			"edit",
+			"bash",
+			"bg",
+			"codemode",
+			"mcp__brave_search__web_search",
+			"subagent",
+		]);
+	});
+
+	it("falls back to the current set when no snapshot exists", () => {
+		assert.deepEqual(restoreUnconnectedTools([], ["read", ...CHAT_TOOLS, "subagent"]), ["read", "subagent"]);
 	});
 });
 
