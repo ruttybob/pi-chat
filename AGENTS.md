@@ -11,7 +11,7 @@ Telegram ←→ Account feed ←→ Runtime (log, jobs, slices) ←→ pi agent
                          /workspace  /shared
 ```
 
-- **One conversation = one VM.** A conversation is a DM, a group, or a forum **topic** (supergroup with Topics enabled; General = thread 1). One topic = one channel = one workspace/memory, like Discord channels.
+- **One conversation = one VM.** A conversation is a DM, a group, or a forum **topic** (supergroup with Topics enabled; General = thread 1). Threaded-mode DMs (Bot API 9.3+ "Topics in private chats", detected via `getMe.has_topics_enabled`) behave like forums: General = 1, and unknown topics become channels lazily on first message. One topic = one channel = one workspace/memory, like Discord channels.
 - **One `getUpdates` poller per bot token** (Telegram allows a single consumer): `src/live/feed.ts` takes an account-level lock (`feed.lock`), persists its cursor in `feed.json`, and fans updates out to conversation logs by (chat id, thread_id). Followers tail their own logs (`runtime.absorbExternalRecords`) and take over leadership if the leader dies.
 - **Cross-process log appends go through `.lock.append`** (`withAppendLock` in `src/log.ts`): recordIds are allocated from the log tail under the lock, so the feed leader and the conversation worker never collide.
 - **Tools run inside the VM.** `read`/`write`/`edit`/`bash` are VM delegates registered with `exposure: "codemode"` (pi 1.4.0 API; dev types are older, hence casts); `chat_history`, `chat_attach`, `chat_workers`, `chat_request_secret` run on the host. Per-channel `tools` whitelist is enforced in the `tool_call` hook during remote turns.
@@ -115,3 +115,24 @@ Parsed by `ConversationRuntime.parseControlCommand()`: `stop`, `new`, `compact`,
 - No ambient host env leaks into VM.
 - All paths shown to the model use guest-relative paths (`/workspace/...`, `/shared/...`).
 - Transcript lines include `[uid:ID]` for tamper-resistant user identification.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues on the `ruttybob/pi-chat` fork (never upstream `earendil-works/pi-chat`). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` + `docs/adr/`. See `docs/agents/domain.md`.
+
+<!-- groma:start -->
+## Groma
+
+This project uses Groma. Before you scan, inspect, or curate architecture, or change files for a Backlog task, run `groma agent-instructions` and read the guide it names for that job. When it reports a first scan, ask the user whether they want you to curate the architecture. Do not edit Groma-owned architecture files directly.
+<!-- groma:end -->
+
