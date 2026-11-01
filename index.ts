@@ -1186,6 +1186,18 @@ export default function (pi: ExtensionAPI) {
 		}
 		try {
 			chatTurnInFlight = true;
+			// ADR 0001: remoteMcp allowlist edits must reach detached workers too — there is no
+			// IPC, so each remote turn starts by re-reading the config. A stale allowlist on a
+			// config read failure is acceptable: the in-memory set still applies.
+			try {
+				const fresh = resolveConversation(await loadChatConfig(), runtime.conversation.conversationId);
+				if (fresh && JSON.stringify(fresh.account.remoteMcp ?? null) !== JSON.stringify(connectedRemoteMcp ?? null)) {
+					connectedRemoteMcp = fresh.account.remoteMcp;
+					applyConnectedTools();
+				}
+			} catch {
+				// keep the in-memory allowlist
+			}
 			activeTriggerMessageId = next.triggerMessageId;
 			queuedOutboundAttachments = [];
 			pendingChatDispatch = true;
@@ -1303,6 +1315,17 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ADR 0002: no IPC — a detached worker rebuilds its sandbox only at (re)start, so mount
+	// changes made in another process (the interactive TUI) do not reach a live worker.
+	function notifyWorkerRestartNeeded(ctx: ExtensionContext, conversationId: string): void {
+		if (pi.getFlag(CHAT_CONVERSATION_FLAG)) return; // we ARE the worker; applyAndRestart covers us
+		if (!listTmuxSessions().has(tmuxSafeName(conversationId))) return;
+		ctx.ui.notify(
+			"A detached worker is connected to this channel: restart it (/chat-spawn-all --restart) so it picks up the new mounts.",
+			"warning",
+		);
+	}
+
 	pi.registerCommand("chat-project-mount", {
 		description: "Mount a host folder into the VM: /chat-project-mount [path] [ro|rw|unmount]",
 		handler: async (args, ctx) => {
@@ -1355,6 +1378,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Unmounted ${PROJECT_MOUNT_GUEST_PATH}. Any worktree copy was kept.`, "info");
 				await applyAndRestart();
 				await injectMountsReminder(ctx, true);
+				notifyWorkerRestartNeeded(ctx, conversation.conversationId);
 				return;
 			}
 			let hostPath: string;
@@ -1404,6 +1428,7 @@ export default function (pi: ExtensionAPI) {
 			);
 			await applyAndRestart();
 			await injectMountsReminder(ctx, true);
+			notifyWorkerRestartNeeded(ctx, conversation.conversationId);
 		},
 	});
 	pi.registerCommand("chat-list", {
